@@ -1,1 +1,76 @@
+# macOS
 .DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+dist/
+build/
+site/
+.eggs/
+*.egg
+*.egg-info/
+pip-wheel-metadata/
+.venv/
+venv/
+env/
+ENV/
+
+# Node / frontend
+node_modules/
+.npm/
+.pnpm-store/
+.yarn/
+.parcel-cache/
+.vite/
+coverage/
+*.tsbuildinfo
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local app runtime data
+storage/
+uploads/
+tmp/
+temp/
+
+# OS / archive noise
+*.bak
+*.tmp
+*.temp
+*.orig
