@@ -66,6 +66,7 @@ pnpm-debug.log*
 
 # Local app runtime data
 storage/*
+storage/**/*
 !storage/.gitkeep
 !storage/README.md
 !storage/files/
