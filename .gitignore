@@ -36,6 +36,7 @@ ENV/
 # Node / frontend
 node_modules/
 .npm/
+.npm-cache/
 .pnpm-store/
 .yarn/
 .parcel-cache/
