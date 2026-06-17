@@ -65,7 +65,15 @@ yarn-error.log*
 pnpm-debug.log*
 
 # Local app runtime data
-storage/
+storage/*
+!storage/.gitkeep
+!storage/README.md
+!storage/files/
+!storage/files/.gitkeep
+!storage/exports/
+!storage/exports/.gitkeep
+!storage/logs/
+!storage/logs/.gitkeep
 uploads/
 tmp/
 temp/
