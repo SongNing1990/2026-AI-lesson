@@ -48,3 +48,14 @@ class DocumentLinkImportRequest(BaseModel):
 class DocumentSingleUrlImportRequest(BaseModel):
     knowledge_base_id: str
     url: str
+
+
+class DocumentBatchMoveRequest(BaseModel):
+    document_ids: List[str]
+    target_knowledge_base_id: str
+
+
+class DocumentBatchMoveResponse(BaseModel):
+    success: bool
+    moved_ids: List[str]
+    target_knowledge_base_id: str

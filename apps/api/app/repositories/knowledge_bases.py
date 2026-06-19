@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from app.models.document_chunks import DocumentChunk
 from app.models.documents import Document
 from app.models.knowledge_bases import KnowledgeBase
+from app.services.vector_store import delete_knowledge_base_vectors
 
 
 def utc_now() -> datetime:
@@ -70,4 +71,5 @@ def delete_knowledge_base_records(session: Session, knowledge_base_id: str) -> b
 
     session.delete(knowledge_base)
     session.commit()
+    delete_knowledge_base_vectors(knowledge_base_id)
     return True

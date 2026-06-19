@@ -12,3 +12,4 @@ Pillow==11.0.0
 rapidocr-onnxruntime==1.4.4
 opencc-python-reimplemented==0.1.7
 reportlab==4.2.5
+chromadb==1.5.9

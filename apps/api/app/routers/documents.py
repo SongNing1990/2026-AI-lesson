@@ -22,9 +22,12 @@ from app.repositories.documents import (
     list_document_chunks,
     list_documents,
     replace_document_chunks,
+    update_document_knowledge_base,
 )
 from app.repositories.knowledge_bases import get_knowledge_base, utc_now
 from app.schemas.documents import (
+    DocumentBatchMoveRequest,
+    DocumentBatchMoveResponse,
     DocumentLinkImportRequest,
     DocumentResponse,
     DocumentSingleUrlImportRequest,
@@ -40,6 +43,7 @@ from app.services.document_parsers import (
     chunk_segments,
     load_text_from_document,
 )
+from app.services.vector_store import delete_document_vectors, sync_document_vectors
 from app.services.web_imports import build_fetch_candidates, fetch_webpage, normalize_url
 
 router = APIRouter(prefix="/documents", tags=["documents"])
@@ -58,6 +62,15 @@ def parse_and_index_document(document: Document, session: Session) -> Document:
         document.page_count = len({segment.page_number for segment in segments if segment.page_number is not None}) or None
         chunks = chunk_segments(document, segments)
         replace_document_chunks(session, document.id, chunks)
+        knowledge_base = get_knowledge_base(session, document.knowledge_base_id)
+        if knowledge_base is not None:
+            sync_document_vectors(
+                knowledge_base_name=knowledge_base.name,
+                document_name=document.name,
+                document_id=document.id,
+                knowledge_base_id=document.knowledge_base_id,
+                chunks=chunks,
+            )
         document.parse_status = "done"
         document.parse_error = None
         document.last_parsed_at = utc_now()
@@ -131,6 +144,10 @@ def import_urls_to_documents(
                 updated_at=now,
             )
             create_document(session, document)
+            try:
+                document = parse_and_index_document(document, session)
+            except Exception:
+                document = get_document(session, document.id) or document
             success_items.append(
                 DocumentUploadSuccess(
                     file_name=final_url,
@@ -281,6 +298,10 @@ async def upload_documents(
             updated_at=now,
         )
         create_document(session, document)
+        try:
+            document = parse_and_index_document(document, session)
+        except Exception:
+            document = get_document(session, document.id) or document
         success_items.append(
             DocumentUploadSuccess(
                 file_name=raw_name,
@@ -322,6 +343,51 @@ def import_document_links_legacy(
     session: Session = Depends(get_db_session),
 ) -> DocumentUploadResponse:
     return import_urls_to_documents(payload.knowledge_base_id, payload.urls, session)
+
+
+@router.post("/move", response_model=DocumentBatchMoveResponse)
+def move_documents_between_knowledge_bases(
+    payload: DocumentBatchMoveRequest,
+    session: Session = Depends(get_db_session),
+) -> DocumentBatchMoveResponse:
+    target_knowledge_base = get_knowledge_base(session, payload.target_knowledge_base_id)
+    if target_knowledge_base is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target knowledge base not found.")
+
+    moved_ids: List[str] = []
+
+    for document_id in payload.document_ids:
+        document = get_document(session, document_id)
+        if document is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Document not found: {document_id}")
+        if document.knowledge_base_id == payload.target_knowledge_base_id:
+            moved_ids.append(document_id)
+            continue
+
+        updated_document = update_document_knowledge_base(session, document_id, payload.target_knowledge_base_id)
+        if updated_document is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Document not found: {document_id}")
+
+        delete_document_vectors(document_id)
+        chunks = list_document_chunks(session, document_id)
+        sync_document_vectors(
+            knowledge_base_name=target_knowledge_base.name,
+            document_name=updated_document.name,
+            document_id=updated_document.id,
+            knowledge_base_id=payload.target_knowledge_base_id,
+            chunks=chunks,
+        )
+        moved_ids.append(document_id)
+
+    target_knowledge_base.updated_at = utc_now()
+    session.add(target_knowledge_base)
+    session.commit()
+
+    return DocumentBatchMoveResponse(
+        success=True,
+        moved_ids=moved_ids,
+        target_knowledge_base_id=payload.target_knowledge_base_id,
+    )
 
 
 @router.get("/{document_id}/open")
@@ -390,6 +456,8 @@ def delete_document(document_id: str, session: Session = Depends(get_db_session)
     deleted = delete_document_record(session, document_id)
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
+
+    delete_document_vectors(document_id)
 
     if file_path is not None and file_path.exists():
         try:

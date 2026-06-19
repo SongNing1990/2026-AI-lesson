@@ -32,6 +32,23 @@ def create_document(session: Session, document: Document) -> Document:
     return document
 
 
+def update_document_knowledge_base(session: Session, document_id: str, knowledge_base_id: str) -> Optional[Document]:
+    document = session.get(Document, document_id)
+    if document is None:
+        return None
+
+    document.knowledge_base_id = knowledge_base_id
+    session.add(document)
+
+    session.query(DocumentChunk).filter(DocumentChunk.document_id == document_id).update(
+        {DocumentChunk.knowledge_base_id: knowledge_base_id},
+        synchronize_session=False,
+    )
+    session.commit()
+    session.refresh(document)
+    return document
+
+
 def delete_document_record(session: Session, document_id: str) -> bool:
     document = session.get(Document, document_id)
     if document is None:
