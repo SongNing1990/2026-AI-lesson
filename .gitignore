@@ -69,8 +69,11 @@ storage/*
 storage/**/*
 !storage/.gitkeep
 !storage/README.md
+!storage/app.db
+!storage/chroma/
+!storage/chroma/**
 !storage/files/
-!storage/files/.gitkeep
+!storage/files/**
 !storage/exports/
 !storage/exports/.gitkeep
 !storage/logs/
