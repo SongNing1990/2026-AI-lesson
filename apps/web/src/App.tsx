@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useDeferredValue, useEffect, useMemo, useState } from "react";
 import { NavLink, Navigate, Route, Routes } from "react-router-dom";
 
 const API_CANDIDATES = Array.from(
@@ -59,18 +59,29 @@ type SystemConfig = {
   database_path: string;
   ocr_enabled: boolean;
   model_config_name: string;
+  llm_enabled: boolean;
+  llm_provider: string;
+  llm_model_name: string;
+  llm_base_url: string;
+  llm_timeout_seconds: number;
+  llm_temperature: number;
+  llm_max_tokens: number;
+  llm_fallback_to_extractive: boolean;
+};
+
+type LLMStatus = {
+  available: boolean;
+  provider: string;
+  model: string;
+  reachable: boolean;
+  message: string;
 };
 
 type ContextTarget =
   | { type: "category"; id: string; x: number; y: number }
   | { type: "knowledgeBase"; id: string; x: number; y: number }
-  | { type: "document"; id: string; x: number; y: number };
-
-type HoverPreviewState = {
-  documentId: string;
-  x: number;
-  y: number;
-};
+  | { type: "document"; id: string; x: number; y: number }
+  | { type: "chatSession"; id: string; x: number; y: number };
 
 type KnowledgeBaseCategoryActionMode = "move" | "assign";
 
@@ -121,12 +132,76 @@ type QAResponse = {
   matched_documents: QAMatchedDocument[];
   answer_limited: boolean;
   message: string | null;
+  session_id?: string | null;
+};
+
+type ChatSessionSummary = {
+  id: string;
+  title: string | null;
+  knowledge_base_ids: string[];
+  last_message_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+type ChatMessageRecord = {
+  id: string;
+  session_id: string;
+  role: "user" | "assistant";
+  question_text: string | null;
+  answer_markdown: string | null;
+  citations_json: string | null;
+  retrieval_snapshot_json: string | null;
+  created_at: string;
+};
+
+type ChatSessionDetail = {
+  session: ChatSessionSummary;
+  messages: ChatMessageRecord[];
+};
+
+type ChatSearchResult = {
+  sessionId: string;
+  knowledgeBaseId: string | null;
+  knowledgeBaseName: string;
+  question: string;
+  answer: string;
+  displayAnswer: string;
+  createdAt: string;
+  messageId: string;
 };
 
 type QAResultMeta = {
   knowledgeBaseName: string | null;
+  knowledgeBaseNames?: string[];
   question: string;
   shared: boolean;
+};
+
+type DocumentParseFilter = "all" | "pending" | "processing" | "done" | "failed";
+
+type ExportJobResponse = {
+  id: string;
+  format: string;
+  status: string;
+  output_path: string | null;
+  download_url: string | null;
+  error_message: string | null;
+  created_at: string;
+  finished_at: string | null;
+};
+
+type KnowledgeBaseReindexResponse = {
+  knowledge_base_id: string;
+  knowledge_base_name: string;
+  total_documents: number;
+  reindexed_documents: number;
+  failed_documents: Array<{
+    document_id: string;
+    document_name: string;
+    reason: string;
+  }>;
+  total_chunks: number;
 };
 
 type SharePayload = {
@@ -198,6 +273,32 @@ async function requestForm(path: string, init: Omit<RequestInit, "body"> & { bod
 
 function buildApiUrl(path: string) {
   return `${API_CANDIDATES[0]}${path}`;
+}
+
+function mapQaErrorMessage(rawMessage: string) {
+  const message = rawMessage.trim();
+  const lower = message.toLowerCase();
+
+  if (
+    message.includes("无法连接本地 Ollama 服务") ||
+    message.includes("本地 Ollama 服务不可用") ||
+    (lower.includes("ollama") && (lower.includes("connect") || lower.includes("unavailable")))
+  ) {
+    return "本地 Qwen 服务未连接。请先启动 Ollama，再重试提问。";
+  }
+  if (message.includes("未找到模型") || message.includes("未安装")) {
+    return "本地 Qwen 模型未下载。请先执行 `ollama pull qwen2.5:7b-instruct`。";
+  }
+  if (message.includes("超时")) {
+    return "本地 Qwen 响应超时。请稍后重试，或降低问题复杂度。";
+  }
+  if (message === "Failed to fetch") {
+    return "无法连接后端服务。请确认后端接口 `http://127.0.0.1:8000` 已启动。";
+  }
+  if (message.includes("Internal Server Error")) {
+    return "后端处理问答时发生异常。请查看后端日志后重试。";
+  }
+  return message || "问答失败，请稍后重试。";
 }
 
 function roundRect(
@@ -288,6 +389,90 @@ function writeKnowledgeBaseStorage(data: KnowledgeBase[]) {
   window.localStorage.setItem(KNOWLEDGE_BASE_STORAGE_KEY, JSON.stringify(data));
 }
 
+function parseJsonArray<T>(value: string | null): T[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value) as T[];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function buildSearchableAnswerText(message: ChatMessageRecord) {
+  let answer = message.answer_markdown || "";
+  const citations = parseJsonArray<QACitation>(message.citations_json);
+  const matchedDocuments = parseJsonArray<QAMatchedDocument>(message.retrieval_snapshot_json);
+  const excludedNames = Array.from(
+    new Set(
+      [...citations.map((item) => item.document_name), ...matchedDocuments.map((item) => item.document_name)]
+        .map((item) => item.trim())
+        .filter(Boolean)
+    )
+  );
+
+  for (const name of excludedNames) {
+    answer = answer.replace(new RegExp(escapeRegExp(name), "g"), " ");
+  }
+
+  return answer.replace(/\s+/g, " ").trim();
+}
+
+function renderHighlightedSnippet(
+  snippet: string,
+  ranges: Array<{
+    start: number;
+    end: number;
+  }>
+) {
+  if (!snippet) return "当前没有可展示的命中片段。";
+  if (ranges.length === 0) return snippet;
+
+  const normalized = ranges
+    .map((range) => ({
+      start: Math.max(0, Math.min(range.start, snippet.length)),
+      end: Math.max(0, Math.min(range.end, snippet.length)),
+    }))
+    .filter((range) => range.end > range.start)
+    .sort((left, right) => left.start - right.start);
+
+  if (normalized.length === 0) return snippet;
+
+  const merged: Array<{ start: number; end: number }> = [];
+  for (const range of normalized) {
+    const previous = merged[merged.length - 1];
+    if (!previous || range.start > previous.end) {
+      merged.push({ ...range });
+      continue;
+    }
+    previous.end = Math.max(previous.end, range.end);
+  }
+
+  const parts: Array<string | JSX.Element> = [];
+  let cursor = 0;
+  merged.forEach((range, index) => {
+    if (cursor < range.start) {
+      parts.push(snippet.slice(cursor, range.start));
+    }
+    parts.push(
+      <mark key={`highlight-${index}-${range.start}-${range.end}`} className="qa-highlight-mark">
+        {snippet.slice(range.start, range.end)}
+      </mark>
+    );
+    cursor = range.end;
+  });
+
+  if (cursor < snippet.length) {
+    parts.push(snippet.slice(cursor));
+  }
+
+  return parts;
+}
+
 function AppWorkspace() {
   const [config, setConfig] = useState<SystemConfig | null>(null);
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBase[]>(() => readKnowledgeBaseStorage());
@@ -308,6 +493,9 @@ function AppWorkspace() {
   const [showCategoryModal, setShowCategoryModal] = useState(false);
   const [showMoveModal, setShowMoveModal] = useState(false);
   const [showUploadModal, setShowUploadModal] = useState(false);
+  const [showChatHistoryModal, setShowChatHistoryModal] = useState(false);
+  const [selectedChatSearchHit, setSelectedChatSearchHit] = useState<ChatSearchResult | null>(null);
+  const [chatSessionSearch, setChatSessionSearch] = useState("");
   const [knowledgeBaseCategoryActionMode, setKnowledgeBaseCategoryActionMode] =
     useState<KnowledgeBaseCategoryActionMode>("move");
   const [knowledgeBaseCategoryActionIds, setKnowledgeBaseCategoryActionIds] = useState<string[]>([]);
@@ -315,19 +503,30 @@ function AppWorkspace() {
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [linkDraft, setLinkDraft] = useState("");
   const [selectedDocument, setSelectedDocument] = useState<DocumentMeta | null>(null);
+  const [hoveredDocumentId, setHoveredDocumentId] = useState<string | null>(null);
   const [selectedDocumentIds, setSelectedDocumentIds] = useState<string[]>([]);
+  const [documentStatusFilter, setDocumentStatusFilter] = useState<DocumentParseFilter>("all");
+  const [knowledgeBaseSelectionMode, setKnowledgeBaseSelectionMode] = useState(false);
   const [documentSelectionMode, setDocumentSelectionMode] = useState(false);
-  const [hoverPreview, setHoverPreview] = useState<HoverPreviewState | null>(null);
+  const [showDocumentStatusCenter, setShowDocumentStatusCenter] = useState(false);
   const [rightPanelMode, setRightPanelMode] = useState<"knowledgeBases" | "documents">("knowledgeBases");
   const [contextTarget, setContextTarget] = useState<ContextTarget | null>(null);
   const [questionDraft, setQuestionDraft] = useState("");
+  const [chatSessions, setChatSessions] = useState<ChatSessionSummary[]>([]);
+  const [activeChatSessionId, setActiveChatSessionId] = useState("");
+  const [activeChatMessages, setActiveChatMessages] = useState<ChatMessageRecord[]>([]);
+  const [chatSessionDetailCache, setChatSessionDetailCache] = useState<Record<string, ChatSessionDetail>>({});
+  const [chatSearchResults, setChatSearchResults] = useState<ChatSearchResult[]>([]);
+  const [chatSearchLoading, setChatSearchLoading] = useState(false);
+  const [loadingChatSessions, setLoadingChatSessions] = useState(false);
   const [qaResult, setQaResult] = useState<QAResponse | null>(null);
   const [qaMeta, setQaMeta] = useState<QAResultMeta | null>(null);
-  const [shareMenuOpen, setShareMenuOpen] = useState(false);
+  const [activeCitation, setActiveCitation] = useState<QACitation | null>(null);
   const [shareCode, setShareCode] = useState<string | null>(null);
   const [toast, setToast] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [isAnswering, setIsAnswering] = useState(false);
 
   const categorizedKnowledgeBaseIds = useMemo(
     () => new Set(categories.flatMap((item) => item.knowledgeBaseIds)),
@@ -356,50 +555,85 @@ function AppWorkspace() {
     [knowledgeBases, selectedKnowledgeBaseId]
   );
 
-  const hoveredDocumentPreview = useMemo(() => {
-    if (!hoverPreview?.documentId) return null;
-    const document = documents.find((item) => item.id === hoverPreview.documentId);
-    if (!document) return null;
-    const text = (document.preview_text || "").replace(/\s+/g, " ").trim();
-    return {
-      id: document.id,
-      name: document.name,
-      preview: text ? `${text.slice(0, 200)}${text.length > 200 ? "..." : ""}` : "当前还没有可预览的解析内容。",
-    };
-  }, [documents, hoverPreview]);
+  const activeCitationDocument = useMemo(() => {
+    if (!activeCitation) return null;
+    return documents.find((item) => item.id === activeCitation.document_id) ?? null;
+  }, [activeCitation, documents]);
+
+  const summaryDocument = useMemo(() => {
+    if (hoveredDocumentId) {
+      return documents.find((item) => item.id === hoveredDocumentId) ?? selectedDocument;
+    }
+    return selectedDocument;
+  }, [documents, hoveredDocumentId, selectedDocument]);
 
   const selectedKnowledgeBases = useMemo(
     () => knowledgeBases.filter((item) => selectedKnowledgeBaseIds.includes(item.id)),
     [knowledgeBases, selectedKnowledgeBaseIds]
   );
 
+  const effectiveQuestionKnowledgeBases = useMemo(() => {
+    if (selectedKnowledgeBases.length > 0) return selectedKnowledgeBases;
+    return selectedKnowledgeBase ? [selectedKnowledgeBase] : [];
+  }, [selectedKnowledgeBase, selectedKnowledgeBases]);
+
+  const effectiveQuestionKnowledgeBaseIds = useMemo(
+    () => effectiveQuestionKnowledgeBases.map((item) => item.id),
+    [effectiveQuestionKnowledgeBases]
+  );
+
+  const effectiveQuestionKnowledgeBaseLabel = useMemo(() => {
+    if (effectiveQuestionKnowledgeBases.length === 0) return null;
+    if (effectiveQuestionKnowledgeBases.length === 1) return effectiveQuestionKnowledgeBases[0].name;
+    return `${effectiveQuestionKnowledgeBases[0].name} 等 ${effectiveQuestionKnowledgeBases.length} 个知识库`;
+  }, [effectiveQuestionKnowledgeBases]);
+
   const selectedDocuments = useMemo(
     () => documents.filter((item) => selectedDocumentIds.includes(item.id)),
     [documents, selectedDocumentIds]
   );
 
-  function buildHoverPreviewPosition(rect: DOMRect): HoverPreviewState {
-    const previewWidth = 280;
-    const previewHeight = 190;
-    const gap = 14;
-    const viewportPadding = 16;
+  const filteredDocuments = useMemo(
+    () => (documentStatusFilter === "all" ? documents : documents.filter((item) => item.parse_status === documentStatusFilter)),
+    [documentStatusFilter, documents]
+  );
 
-    const preferRight = rect.right + gap + previewWidth <= window.innerWidth - viewportPadding;
-    const left = preferRight
-      ? rect.right + gap
-      : Math.max(viewportPadding, rect.left - gap - previewWidth);
+  const activeChatSession = useMemo(
+    () => chatSessions.find((item) => item.id === activeChatSessionId) ?? null,
+    [chatSessions, activeChatSessionId]
+  );
 
-    const top = Math.min(
-      Math.max(viewportPadding, rect.top),
-      Math.max(viewportPadding, window.innerHeight - previewHeight - viewportPadding)
+  const currentKnowledgeBaseSession = useMemo(() => {
+    if (effectiveQuestionKnowledgeBaseIds.length === 0) return null;
+    const expectedIds = [...effectiveQuestionKnowledgeBaseIds].sort();
+    return (
+      chatSessions.find((item) => {
+        const currentIds = [...item.knowledge_base_ids].sort();
+        return currentIds.length === expectedIds.length && currentIds.every((value, index) => value === expectedIds[index]);
+      }) ?? null
     );
+  }, [chatSessions, effectiveQuestionKnowledgeBaseIds]);
 
-    return {
-      documentId: "",
-      x: left,
-      y: top,
-    };
-  }
+  const visibleChatSessions = useMemo(
+    () => (currentKnowledgeBaseSession ? [currentKnowledgeBaseSession] : []),
+    [currentKnowledgeBaseSession]
+  );
+
+  const recentKnowledgeBases = useMemo(
+    () =>
+      [...knowledgeBases]
+        .sort((a, b) => {
+          const left = a.last_opened_at ? new Date(a.last_opened_at).getTime() : 0;
+          const right = b.last_opened_at ? new Date(b.last_opened_at).getTime() : 0;
+          return right - left;
+        })
+        .slice(0, 3),
+    [knowledgeBases]
+  );
+
+  const recentChatSessions = useMemo(() => chatSessions.slice(0, 4), [chatSessions]);
+
+  const deferredChatSessionSearch = useDeferredValue(chatSessionSearch);
 
   useEffect(() => {
     async function bootstrap() {
@@ -516,6 +750,7 @@ function AppWorkspace() {
     if (!selectedKnowledgeBaseId) {
       setDocuments([]);
       setSelectedDocument(null);
+      setDocumentStatusFilter("all");
       return;
     }
 
@@ -529,7 +764,6 @@ function AppWorkspace() {
         setSelectedDocumentIds(docs[0] ? [docs[0].id] : []);
         setQaResult(null);
         setQaMeta(null);
-        setShareMenuOpen(false);
       } catch (err) {
         setError(err instanceof Error ? err.message : "文档读取失败");
       }
@@ -537,6 +771,167 @@ function AppWorkspace() {
 
     void loadDocuments();
   }, [selectedKnowledgeBaseId]);
+
+  useEffect(() => {
+    if (filteredDocuments.length === 0) {
+      if (documentStatusFilter !== "all") {
+        setSelectedDocument(null);
+        setSelectedDocumentIds([]);
+      }
+      return;
+    }
+    if (!selectedDocument || !filteredDocuments.some((item) => item.id === selectedDocument.id)) {
+      setSelectedDocument(filteredDocuments[0]);
+      setSelectedDocumentIds((current) => {
+        const remaining = current.filter((id) => filteredDocuments.some((item) => item.id === id));
+        return remaining.length > 0 ? remaining : [filteredDocuments[0].id];
+      });
+    }
+  }, [documentStatusFilter, filteredDocuments, selectedDocument]);
+
+  useEffect(() => {
+    void loadChatSessions();
+  }, []);
+
+  useEffect(() => {
+    const sessionIdsToFetch = chatSessions
+      .map((session) => session.id)
+      .filter((sessionId) => !chatSessionDetailCache[sessionId]);
+
+    if (sessionIdsToFetch.length === 0) return;
+
+    let cancelled = false;
+
+    async function warmChatSessionDetails() {
+      try {
+        const details = await Promise.all(
+          sessionIdsToFetch.map((sessionId) => requestJson<ChatSessionDetail>(`/chat/sessions/${sessionId}`))
+        );
+        if (cancelled) return;
+        setChatSessionDetailCache((current) => {
+          const next = { ...current };
+          for (const detail of details) {
+            next[detail.session.id] = detail;
+          }
+          return next;
+        });
+      } catch {
+        // ignore background cache warm errors
+      }
+    }
+
+    const timeout = window.setTimeout(() => {
+      void warmChatSessionDetails();
+    }, 120);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeout);
+    };
+  }, [chatSessions, chatSessionDetailCache]);
+
+  useEffect(() => {
+    const keyword = deferredChatSessionSearch.trim().toLowerCase();
+    if (!keyword) {
+      setChatSearchResults([]);
+      setChatSearchLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+
+    async function searchChatHistory() {
+      setChatSearchLoading(true);
+      try {
+        const cachedDetails = chatSessions
+          .map((session) => chatSessionDetailCache[session.id])
+          .filter((detail): detail is ChatSessionDetail => Boolean(detail));
+
+        const missingSessionIds = chatSessions
+          .map((session) => session.id)
+          .filter((sessionId) => !chatSessionDetailCache[sessionId]);
+
+        const fetchedDetails =
+          missingSessionIds.length > 0
+            ? await Promise.all(
+                missingSessionIds.map((sessionId) => requestJson<ChatSessionDetail>(`/chat/sessions/${sessionId}`))
+              )
+            : [];
+
+        const details = [...cachedDetails, ...fetchedDetails];
+
+        if (cancelled) return;
+
+        if (fetchedDetails.length > 0) {
+          setChatSessionDetailCache((current) => {
+            const next = { ...current };
+            for (const detail of fetchedDetails) {
+              next[detail.session.id] = detail;
+            }
+            return next;
+          });
+        }
+
+        const knowledgeBaseNameById = new Map(knowledgeBases.map((item) => [item.id, item.name]));
+        const results: ChatSearchResult[] = [];
+
+        for (const detail of details) {
+          let latestQuestion = "";
+          const knowledgeBaseId = detail.session.knowledge_base_ids[0] ?? null;
+          const knowledgeBaseName =
+            (knowledgeBaseId ? knowledgeBaseNameById.get(knowledgeBaseId) : null) || detail.session.title || "未命名知识库";
+
+          for (const message of detail.messages) {
+            if (message.role === "user") {
+              latestQuestion = message.question_text || "";
+              continue;
+            }
+            if (message.role !== "assistant") continue;
+            const answer = buildSearchableAnswerText(message);
+            const haystack = `${latestQuestion} ${answer}`.toLowerCase();
+            if (!haystack.includes(keyword)) continue;
+            results.push({
+              sessionId: detail.session.id,
+              knowledgeBaseId,
+              knowledgeBaseName,
+              question: latestQuestion || "未找到对应提问",
+              answer,
+              displayAnswer: message.answer_markdown || answer,
+              createdAt: message.created_at,
+              messageId: message.id,
+            });
+          }
+        }
+
+        results.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        setChatSearchResults(results);
+      } catch (err) {
+        if (!cancelled) {
+          setError(err instanceof Error ? err.message : "问答检索失败");
+        }
+      } finally {
+        if (!cancelled) setChatSearchLoading(false);
+      }
+    }
+
+    void searchChatHistory();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [deferredChatSessionSearch, chatSessions, chatSessionDetailCache, knowledgeBases]);
+
+  useEffect(() => {
+    if (!selectedKnowledgeBaseId) return;
+    const matchedSession = chatSessions.find((item) => item.knowledge_base_ids.includes(selectedKnowledgeBaseId));
+    if (matchedSession) {
+      setActiveChatSessionId(matchedSession.id);
+      void loadChatSessionDetail(matchedSession.id);
+      return;
+    }
+    setActiveChatSessionId("");
+    setActiveChatMessages([]);
+  }, [selectedKnowledgeBaseId, chatSessions]);
 
   useEffect(() => {
     if (!toast) return;
@@ -556,19 +951,6 @@ function AppWorkspace() {
     document.addEventListener("mousedown", handlePointerDown);
     return () => document.removeEventListener("mousedown", handlePointerDown);
   }, [contextTarget]);
-
-  useEffect(() => {
-    if (!shareMenuOpen) return;
-
-    function handlePointerDown(event: MouseEvent) {
-      const target = event.target;
-      if (target instanceof Element && target.closest(".qa-share-group")) return;
-      setShareMenuOpen(false);
-    }
-
-    document.addEventListener("mousedown", handlePointerDown);
-    return () => document.removeEventListener("mousedown", handlePointerDown);
-  }, [shareMenuOpen]);
 
   function openCreateKnowledgeBaseModal() {
     setDraftName("");
@@ -618,6 +1000,192 @@ function AppWorkspace() {
     setRightPanelMode("knowledgeBases");
   }
 
+  async function loadChatSessions(nextSessionId?: string) {
+    setLoadingChatSessions(true);
+    try {
+      const sessions = await requestJson<ChatSessionSummary[]>("/chat/sessions");
+      setChatSessions(sessions);
+      const matchedKnowledgeBaseSession =
+        selectedKnowledgeBaseId
+          ? sessions.find(
+              (item) => item.knowledge_base_ids.length === 1 && item.knowledge_base_ids[0] === selectedKnowledgeBaseId
+            )?.id
+          : "";
+      const targetSessionId = nextSessionId ?? matchedKnowledgeBaseSession ?? activeChatSessionId ?? sessions[0]?.id ?? "";
+      if (targetSessionId) {
+        setActiveChatSessionId(targetSessionId);
+        await loadChatSessionDetail(targetSessionId);
+      } else {
+        setActiveChatMessages([]);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "会话加载失败");
+    } finally {
+      setLoadingChatSessions(false);
+    }
+  }
+
+  async function loadChatSessionDetail(sessionId: string) {
+    try {
+      const detail = await requestJson<ChatSessionDetail>(`/chat/sessions/${sessionId}`);
+      setActiveChatSessionId(detail.session.id);
+      setActiveChatMessages(detail.messages);
+      setChatSessionDetailCache((current) => ({
+        ...current,
+        [detail.session.id]: detail,
+      }));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "会话详情加载失败");
+    }
+  }
+
+  async function ensureChatSessionForCurrentKnowledgeBase() {
+    if (effectiveQuestionKnowledgeBaseIds.length === 0) return "";
+    const expectedIds = [...effectiveQuestionKnowledgeBaseIds].sort();
+    const existing = chatSessions.find((item) => {
+      const currentIds = [...item.knowledge_base_ids].sort();
+      return currentIds.length === expectedIds.length && currentIds.every((value, index) => value === expectedIds[index]);
+    });
+    if (existing) {
+      setActiveChatSessionId(existing.id);
+      return existing.id;
+    }
+
+    const created = await requestJson<ChatSessionSummary>("/chat/sessions", {
+      method: "POST",
+      body: JSON.stringify({
+        title: effectiveQuestionKnowledgeBaseLabel ? `${effectiveQuestionKnowledgeBaseLabel} 会话` : "新会话",
+        knowledge_base_ids: effectiveQuestionKnowledgeBaseIds,
+      }),
+    });
+    await loadChatSessions(created.id);
+    setToast("已创建新会话");
+    return created.id;
+  }
+
+  async function renameChatSession(sessionId?: string) {
+    const targetSession = chatSessions.find((item) => item.id === (sessionId || activeChatSessionId)) ?? null;
+    if (!targetSession) {
+      setToast("请先选择一个会话");
+      return;
+    }
+    const draft = window.prompt("输入新的会话名称", targetSession.title ?? "");
+    if (!draft?.trim()) return;
+    try {
+      await requestJson<ChatSessionSummary>(`/chat/sessions/${targetSession.id}/rename`, {
+        method: "POST",
+        body: JSON.stringify({ title: draft.trim() }),
+      });
+      await loadChatSessions(targetSession.id);
+      setToast("会话已重命名");
+      setContextTarget(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "重命名会话失败");
+    }
+  }
+
+  async function clearChatSession(sessionId?: string) {
+    const targetSession = chatSessions.find((item) => item.id === (sessionId || activeChatSessionId)) ?? null;
+    if (!targetSession) {
+      setToast("请先选择一个会话");
+      return;
+    }
+    if (!window.confirm(`将清空会话“${targetSession.title || "未命名会话"}”的全部历史消息。是否继续？`)) {
+      return;
+    }
+    try {
+      await requestJson<{ success: boolean; cleared_session_id: string }>(`/chat/sessions/${targetSession.id}/clear`, {
+        method: "POST",
+      });
+      await loadChatSessionDetail(targetSession.id);
+      setQaResult(null);
+      setQaMeta(null);
+      setToast("会话历史已清空");
+      setContextTarget(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "清空会话失败");
+    }
+  }
+
+  async function deleteChatSession(sessionId?: string) {
+    const targetSession = chatSessions.find((item) => item.id === (sessionId || activeChatSessionId)) ?? null;
+    if (!targetSession) {
+      setToast("请先选择一个会话");
+      return;
+    }
+    if (!window.confirm(`将删除会话“${targetSession.title || "未命名会话"}”。是否继续？`)) {
+      return;
+    }
+    try {
+      await requestJson<{ success: boolean; deleted_id: string }>(`/chat/sessions/${targetSession.id}`, {
+        method: "DELETE",
+      });
+      const nextId =
+        chatSessions.find(
+          (item) => item.id !== targetSession.id && item.knowledge_base_ids.includes(selectedKnowledgeBaseId)
+        )?.id ?? "";
+      setActiveChatSessionId(nextId);
+      setActiveChatMessages([]);
+      await loadChatSessions(nextId || undefined);
+      setQaResult(null);
+      setQaMeta(null);
+      setToast("会话已删除");
+      setContextTarget(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "删除会话失败");
+    }
+  }
+
+  function reopenAnswerFromHistory(message: ChatMessageRecord) {
+    const answer = (message.answer_markdown || "").trim();
+    if (!answer) {
+      setToast("当前回答没有可打开的详情");
+      return;
+    }
+    const citations = parseJsonArray<QACitation>(message.citations_json);
+    const retrievalSnapshot = parseJsonArray<QAMatchedDocument>(message.retrieval_snapshot_json);
+    const matchedDocuments =
+      retrievalSnapshot.length > 0
+        ? retrievalSnapshot
+        : citations.map((citation, index) => ({
+            knowledge_base_id: citation.knowledge_base_id,
+            knowledge_base_name: citation.knowledge_base_name,
+            document_id: `${citation.document_id}-${index}`,
+            document_name: citation.document_name,
+            score: citation.score,
+          }));
+
+    setQaResult({
+      answer,
+      citations,
+      matched_documents: matchedDocuments,
+      answer_limited: false,
+      message: null,
+      session_id: message.session_id,
+    });
+    setQaMeta({
+      knowledgeBaseName: selectedKnowledgeBase?.name ?? null,
+      question: "",
+      shared: false,
+    });
+    setShareCode(null);
+    setToast("已重新打开该条回答");
+  }
+
+  async function openChatHistoryModal(sessionId: string) {
+    await loadChatSessionDetail(sessionId);
+    setShowChatHistoryModal(true);
+  }
+
+  async function openChatHistoryFromSearch(result: ChatSearchResult) {
+    if (result.knowledgeBaseId) {
+      setSelectedKnowledgeBaseId(result.knowledgeBaseId);
+      setSelectedKnowledgeBaseIds([result.knowledgeBaseId]);
+      setRightPanelMode("documents");
+    }
+    setSelectedChatSearchHit(result);
+  }
+
   function toggleMultiSelection(currentIds: string[], id: string, multi: boolean) {
     if (!multi) return [id];
     return currentIds.includes(id) ? currentIds.filter((item) => item !== id) : [...currentIds, id];
@@ -626,14 +1194,20 @@ function AppWorkspace() {
   function handleCategorySelection(categoryId: string, knowledgeBaseIds: string[], multi: boolean) {
     setSelectedCategoryIds((current) => toggleMultiSelection(current, categoryId, multi));
     setSelectedCategoryId(categoryId);
-    setSelectedKnowledgeBaseId(knowledgeBaseIds[0] ?? "");
+    setRightPanelMode("knowledgeBases");
     if (!multi) {
-      setSelectedKnowledgeBaseIds(knowledgeBaseIds[0] ? [knowledgeBaseIds[0]] : []);
+      setSelectedKnowledgeBaseId("");
+      setSelectedKnowledgeBaseIds([]);
     }
   }
 
   function handleKnowledgeBaseSelection(knowledgeBaseId: string, multi: boolean) {
-    setSelectedKnowledgeBaseIds((current) => toggleMultiSelection(current, knowledgeBaseId, multi));
+    setSelectedKnowledgeBaseIds((current) => {
+      if (!multi && current.length > 1 && current.includes(knowledgeBaseId)) {
+        return current;
+      }
+      return toggleMultiSelection(current, knowledgeBaseId, multi);
+    });
     setSelectedKnowledgeBaseId(knowledgeBaseId);
     if (!multi) {
       openKnowledgeBaseDocuments(knowledgeBaseId);
@@ -652,6 +1226,25 @@ function AppWorkspace() {
   function toggleKnowledgeBaseCheckbox(knowledgeBaseId: string) {
     setSelectedKnowledgeBaseIds((current) => toggleMultiSelection(current, knowledgeBaseId, true));
     setSelectedKnowledgeBaseId(knowledgeBaseId);
+  }
+
+  function toggleKnowledgeBaseSelectionMode() {
+    setKnowledgeBaseSelectionMode((current) => {
+      if (current) {
+        setSelectedKnowledgeBaseIds([]);
+      }
+      return !current;
+    });
+  }
+
+  function selectAllVisibleKnowledgeBases() {
+    const nextIds = visibleKnowledgeBases.map((item) => item.id);
+    setSelectedKnowledgeBaseIds(nextIds);
+    setSelectedKnowledgeBaseId(visibleKnowledgeBases[0]?.id ?? "");
+  }
+
+  function clearKnowledgeBaseSelection() {
+    setSelectedKnowledgeBaseIds([]);
   }
 
   function toggleDocumentCheckbox(document: DocumentMeta) {
@@ -827,7 +1420,7 @@ function AppWorkspace() {
       setSelectedFiles([]);
       setLinkDraft("");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "网页导入失败");
+      setError(err instanceof Error ? `网页导入失败：${err.message}` : "网页导入失败");
     } finally {
       setLoading(false);
     }
@@ -856,6 +1449,31 @@ function AppWorkspace() {
   function downloadSelectedDocument() {
     if (!selectedDocument || selectedDocument.source_type === "url") return;
     window.open(buildApiUrl(`/documents/${selectedDocument.id}/download`), "_blank", "noopener,noreferrer");
+  }
+
+  async function retryParseDocument(document: DocumentMeta) {
+    if (document.parse_status === "processing") {
+      setToast(`文件正在解析中：${document.name}`);
+      return;
+    }
+    if (document.parse_status === "done") {
+      setToast(`文件已解析完成：${document.name}`);
+      return;
+    }
+
+    setLoading(true);
+    setError("");
+    try {
+      await requestJson<DocumentMeta>(`/documents/${document.id}/retry-parse`, {
+        method: "POST",
+      });
+      await refreshCurrentDocuments(document.id);
+      setToast(`解析完成：${document.name}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "解析文件失败");
+    } finally {
+      setLoading(false);
+    }
   }
 
   async function deleteSelectedDocuments() {
@@ -969,7 +1587,7 @@ function AppWorkspace() {
   }
 
   async function askKnowledgeBaseQuestion() {
-    if (!selectedKnowledgeBaseId) {
+    if (effectiveQuestionKnowledgeBaseIds.length === 0) {
       setError("请先选择一个知识库。");
       return;
     }
@@ -979,28 +1597,33 @@ function AppWorkspace() {
     }
 
     setLoading(true);
+    setIsAnswering(true);
     setError("");
     try {
+      const sessionId = activeChatSessionId || (await ensureChatSessionForCurrentKnowledgeBase());
       const result = await requestJson<QAResponse>("/qa/ask", {
         method: "POST",
         body: JSON.stringify({
           question: questionDraft.trim(),
-          knowledge_base_ids: [selectedKnowledgeBaseId],
+          knowledge_base_ids: effectiveQuestionKnowledgeBaseIds,
+          session_id: sessionId,
           top_k: 5,
         }),
       });
       setQaResult(result);
       setQaMeta({
-        knowledgeBaseName: selectedKnowledgeBase?.name ?? null,
+        knowledgeBaseName: effectiveQuestionKnowledgeBaseLabel,
+        knowledgeBaseNames: effectiveQuestionKnowledgeBases.map((item) => item.name),
         question: questionDraft.trim(),
         shared: false,
       });
       setShareCode(null);
-      setShareMenuOpen(false);
+      await loadChatSessions(result.session_id || sessionId);
       setToast(result.answer_limited ? "当前问题证据不足，已返回受限答案" : "问答完成");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "问答失败");
+      setError(mapQaErrorMessage(err instanceof Error ? err.message : "问答失败"));
     } finally {
+      setIsAnswering(false);
       setLoading(false);
     }
   }
@@ -1015,12 +1638,97 @@ function AppWorkspace() {
     }
   }
 
+  async function exportAnswerAsMarkdown() {
+    if (!qaResult) {
+      setToast("当前没有可导出的回答");
+      return;
+    }
+
+    try {
+      const result = await requestJson<ExportJobResponse>("/export/markdown", {
+        method: "POST",
+        body: JSON.stringify({
+          question: qaMeta?.question || questionDraft.trim() || "未命名问题",
+          answer: qaResult.answer,
+          knowledge_base_ids: effectiveQuestionKnowledgeBaseIds,
+          knowledge_base_names: effectiveQuestionKnowledgeBases.map((item) => item.name),
+          citations: qaResult.citations,
+          session_id: qaResult.session_id || activeChatSessionId || null,
+        }),
+      });
+      if (result.download_url) {
+        window.open(buildApiUrl(result.download_url), "_blank", "noopener,noreferrer");
+      }
+      setToast("Markdown 导出完成");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Markdown 导出失败");
+    }
+  }
+
+  async function exportAnswerAsDocx() {
+    if (!qaResult) {
+      setToast("当前没有可导出的回答");
+      return;
+    }
+
+    try {
+      const result = await requestJson<ExportJobResponse>("/export/docx", {
+        method: "POST",
+        body: JSON.stringify({
+          question: qaMeta?.question || questionDraft.trim() || "未命名问题",
+          answer: qaResult.answer,
+          knowledge_base_ids: effectiveQuestionKnowledgeBaseIds,
+          knowledge_base_names: effectiveQuestionKnowledgeBases.map((item) => item.name),
+          citations: qaResult.citations,
+          session_id: qaResult.session_id || activeChatSessionId || null,
+        }),
+      });
+      if (result.download_url) {
+        window.open(buildApiUrl(result.download_url), "_blank", "noopener,noreferrer");
+      }
+      setToast("DOCX 导出完成");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "DOCX 导出失败");
+    }
+  }
+
+  async function reindexKnowledgeBase(knowledgeBase: KnowledgeBase) {
+    const confirmed = window.confirm(
+      `将重建知识库“${knowledgeBase.name}”的解析结果与向量索引。这个过程不会删除原文件。是否继续？`
+    );
+    if (!confirmed) return;
+
+    setLoading(true);
+    setError("");
+    try {
+      const result = await requestJson<KnowledgeBaseReindexResponse>(`/knowledge-bases/${knowledgeBase.id}/reindex`, {
+        method: "POST",
+      });
+      if (selectedKnowledgeBaseId === knowledgeBase.id) {
+        await refreshCurrentDocuments();
+      }
+      await loadChatSessions(activeChatSessionId || undefined);
+      if (result.failed_documents.length > 0) {
+        setToast(
+          `重建完成：成功 ${result.reindexed_documents}/${result.total_documents}，失败 ${result.failed_documents.length} 个`
+        );
+      } else {
+        setToast(`重建完成：共更新 ${result.reindexed_documents} 个文件，生成 ${result.total_chunks} 个片段`);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "知识库重新索引失败");
+    } finally {
+      setLoading(false);
+      setContextTarget(null);
+    }
+  }
+
   function buildSharePayload(): SharePayload | null {
     if (!qaResult) return null;
     return {
       version: 1,
       question: qaMeta?.question || questionDraft.trim(),
-      knowledgeBaseName: qaMeta?.knowledgeBaseName ?? selectedKnowledgeBase?.name ?? null,
+      knowledgeBaseName: qaMeta?.knowledgeBaseName ?? effectiveQuestionKnowledgeBaseLabel,
       result: qaResult,
     };
   }
@@ -1137,185 +1845,8 @@ function AppWorkspace() {
         return;
       }
       downloadBlob("knowledge-answer-share.png", blob);
-      setToast("已生成答案");
-      setShareMenuOpen(false);
+      setToast("已生成答案分享图片");
     });
-  }
-
-  function buildMindMapHierarchy(answer: string): Array<{ concept: string; subConcepts: string[]; conclusion: string }> {
-    const sentences = answer
-      .split(/[。！？!?；;\n]/)
-      .map((item) => item.trim())
-      .filter((item) => item.length >= 5)
-      .slice(0, 6);
-
-    const extractConcept = (sentence: string) => {
-      const parts = sentence
-        .split(/[：:，、]/)
-        .map((item) => item.trim())
-        .filter((item) => item.length >= 2);
-      const primary = parts[0] || sentence;
-      return primary.replace(/^(关于|对于|围绕|针对|其中|其|该)/, "").slice(0, 14);
-    };
-
-    const extractSubConcepts = (sentence: string, concept: string) => {
-      const source = sentence.replace(concept, "");
-      const parts = source
-        .split(/[，、]/)
-        .map((item) => item.replace(/^(是|为|并|且|以及|通过|体现为|表现为|包括)/, "").trim())
-        .filter((item) => item.length >= 2)
-        .slice(0, 3);
-      return parts.length > 0 ? parts.map((item) => item.slice(0, 18)) : ["关键特征", "实施要点"];
-    };
-
-    const extractConclusion = (sentence: string, subConcepts: string[]) => {
-      const tail = sentence.split(/(因此|所以|说明|表明|体现|意味着)/).slice(-2).join("").trim();
-      if (tail && tail.length >= 4) return tail.slice(0, 24);
-      return `结论：${subConcepts[0] || "形成核心结论"}`.slice(0, 24);
-    };
-
-    const hierarchy = sentences.map((sentence) => {
-      const concept = extractConcept(sentence);
-      const subConcepts = extractSubConcepts(sentence, concept);
-      const conclusion = extractConclusion(sentence, subConcepts);
-      return { concept, subConcepts, conclusion };
-    });
-
-    const deduped = hierarchy.filter(
-      (item, index, list) => list.findIndex((candidate) => candidate.concept === item.concept) === index
-    );
-
-    return deduped.slice(0, 4);
-  }
-
-  function buildMindMapSvg(orientation: "landscape" | "portrait"): string | null {
-    if (!qaResult) return null;
-    const rootText = qaMeta?.question || "知识库问题";
-    const branches = buildMindMapHierarchy(qaResult.answer);
-    if (branches.length === 0) return null;
-
-    const wrapSvgText = (value: string, maxChars: number) => {
-      const chars = Array.from(value);
-      const lines: string[] = [];
-      let current = "";
-      for (const char of chars) {
-        if ((current + char).length > maxChars && current) {
-          lines.push(current);
-          current = char;
-        } else {
-          current += char;
-        }
-      }
-      if (current) lines.push(current);
-      return lines;
-    };
-
-    const isLandscape = orientation === "landscape";
-    const rootLines = wrapSvgText(rootText, isLandscape ? 14 : 12);
-    const width = isLandscape ? 1400 : 1080;
-    const height = isLandscape ? 900 : 1440;
-    const branchBlocks = branches
-      .map((branch, index) => {
-        const conceptLines = wrapSvgText(branch.concept, isLandscape ? 10 : 9).slice(0, 2);
-        const conclusionLines = wrapSvgText(branch.conclusion, isLandscape ? 14 : 12).slice(0, 2);
-        if (isLandscape) {
-          const branchX = 520 + (index % 2) * 400;
-          const branchY = 90 + Math.floor(index / 2) * 360;
-          const branchText = conceptLines
-            .map((line, lineIndex) => `<tspan x="${branchX + 30}" dy="${lineIndex === 0 ? 0 : 28}">${escapeSvg(line)}</tspan>`)
-            .join("");
-          const childBlocks = branch.subConcepts
-            .map((child, childIndex) => {
-              const childY = branchY + 92 + childIndex * 72;
-              const childLines = wrapSvgText(child, 14).slice(0, 2);
-              const childText = childLines
-                .map((line, lineIndex) => `<tspan x="${branchX + 54}" dy="${lineIndex === 0 ? 0 : 24}">${escapeSvg(line)}</tspan>`)
-                .join("");
-              return `
-                <line x1="${branchX + 110}" y1="${branchY + 74}" x2="${branchX + 110}" y2="${childY}" stroke="#8fb7f7" stroke-width="3" />
-                <rect x="${branchX + 24}" y="${childY}" width="172" height="56" rx="18" fill="#f7fbff" stroke="#a2c2f6" />
-                <text x="${branchX + 54}" y="${childY + 30}" fill="#345987" font-size="20" font-family="PingFang SC">${childText}</text>
-              `;
-            })
-            .join("");
-          const conclusionText = conclusionLines
-            .map((line, lineIndex) => `<tspan x="${branchX + 24}" dy="${lineIndex === 0 ? 0 : 24}">${escapeSvg(line)}</tspan>`)
-            .join("");
-          return `
-            <line x1="320" y1="450" x2="${branchX + 110}" y2="${branchY + 36}" stroke="#6aa3f4" stroke-width="4" />
-            <rect x="${branchX}" y="${branchY}" width="220" height="74" rx="22" fill="#ffffff" stroke="#7faef3" />
-            <text x="${branchX + 30}" y="${branchY + 34}" fill="#21497f" font-size="24" font-family="PingFang SC">${branchText}</text>
-            ${childBlocks}
-            <line x1="${branchX + 110}" y1="${branchY + 74 + branch.subConcepts.length * 72}" x2="${branchX + 110}" y2="${branchY + 310}" stroke="#8fb7f7" stroke-width="3" />
-            <rect x="${branchX + 6}" y="${branchY + 310}" width="208" height="68" rx="20" fill="#eaf3ff" stroke="#7faef3" />
-            <text x="${branchX + 24}" y="${branchY + 346}" fill="#1e4e92" font-size="21" font-family="PingFang SC">${conclusionText}</text>
-          `;
-        }
-
-        const branchX = 150 + (index % 2) * 420;
-        const branchY = 470 + Math.floor(index / 2) * 420;
-        const branchText = conceptLines
-          .map((line, lineIndex) => `<tspan x="${branchX + 28}" dy="${lineIndex === 0 ? 0 : 28}">${escapeSvg(line)}</tspan>`)
-          .join("");
-        const childBlocks = branch.subConcepts
-          .map((child, childIndex) => {
-            const childY = branchY + 96 + childIndex * 78;
-            const childLines = wrapSvgText(child, 14).slice(0, 2);
-            const childText = childLines
-              .map((line, lineIndex) => `<tspan x="${branchX + 52}" dy="${lineIndex === 0 ? 0 : 24}">${escapeSvg(line)}</tspan>`)
-              .join("");
-            return `
-              <line x1="${branchX + 104}" y1="${branchY + 80}" x2="${branchX + 104}" y2="${childY}" stroke="#8fb7f7" stroke-width="3" />
-              <rect x="${branchX + 18}" y="${childY}" width="172" height="58" rx="18" fill="#f7fbff" stroke="#a2c2f6" />
-              <text x="${branchX + 52}" y="${childY + 31}" fill="#345987" font-size="20" font-family="PingFang SC">${childText}</text>
-            `;
-          })
-          .join("");
-        const conclusionText = conclusionLines
-          .map((line, lineIndex) => `<tspan x="${branchX + 28}" dy="${lineIndex === 0 ? 0 : 24}">${escapeSvg(line)}</tspan>`)
-          .join("");
-        return `
-          <line x1="540" y1="320" x2="${branchX + 104}" y2="${branchY + 36}" stroke="#6aa3f4" stroke-width="4" />
-          <rect x="${branchX}" y="${branchY}" width="210" height="80" rx="22" fill="#ffffff" stroke="#7faef3" />
-          <text x="${branchX + 28}" y="${branchY + 36}" fill="#21497f" font-size="24" font-family="PingFang SC">${branchText}</text>
-          ${childBlocks}
-          <line x1="${branchX + 104}" y1="${branchY + 80 + branch.subConcepts.length * 78}" x2="${branchX + 104}" y2="${branchY + 338}" stroke="#8fb7f7" stroke-width="3" />
-          <rect x="${branchX + 2}" y="${branchY + 338}" width="206" height="72" rx="20" fill="#eaf3ff" stroke="#7faef3" />
-          <text x="${branchX + 28}" y="${branchY + 374}" fill="#1e4e92" font-size="21" font-family="PingFang SC">${conclusionText}</text>
-        `;
-      })
-      .join("");
-
-    const rootX = isLandscape ? 108 : 412;
-    const rootY = isLandscape ? 436 : 174;
-
-    return `
-      <svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">
-        <defs>
-          <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-            <stop offset="0%" stop-color="#f6fbff"/>
-            <stop offset="100%" stop-color="#e7f1ff"/>
-          </linearGradient>
-        </defs>
-        <rect width="100%" height="100%" fill="url(#bg)" />
-        <rect x="${isLandscape ? 80 : 380}" y="${isLandscape ? 380 : 120}" width="${isLandscape ? 240 : 320}" height="120" rx="26" fill="#1d56c8" />
-        <text x="${rootX}" y="${rootY}" fill="#ffffff" font-size="28" font-family="PingFang SC">
-          ${rootLines.map((line, index) => `<tspan x="${rootX}" dy="${index === 0 ? 0 : 34}">${escapeSvg(line)}</tspan>`).join("")}
-        </text>
-        ${branchBlocks}
-      </svg>
-    `;
-  }
-
-  function downloadMindMap(orientation: "landscape" | "portrait") {
-    const svg = buildMindMapSvg(orientation);
-    if (!svg) return;
-    downloadBlob(
-      orientation === "landscape" ? "knowledge-answer-mindmap-landscape.svg" : "knowledge-answer-mindmap-portrait.svg",
-      new Blob([svg], { type: "image/svg+xml;charset=utf-8" })
-    );
-    setToast(orientation === "landscape" ? "已生成横版思维导图" : "已生成竖版思维导图");
-    setShareMenuOpen(false);
   }
 
   async function deleteKnowledgeBase(knowledgeBase: KnowledgeBase) {
@@ -1692,6 +2223,63 @@ function AppWorkspace() {
               ))}
             </div>
           ) : null}
+
+          <div className="sidebar-group">
+            <p className="sidebar-subtitle">最近使用知识库</p>
+            {recentKnowledgeBases.length === 0 ? (
+              <div className="sidebar-note-card">
+                <strong>还没有最近记录</strong>
+                <p>创建并打开知识库后，这里会显示最近使用项。</p>
+              </div>
+            ) : (
+              recentKnowledgeBases.map((knowledgeBase) => (
+                <button
+                  key={`recent-kb-${knowledgeBase.id}`}
+                  type="button"
+                  className={`sidebar-mini-card ${knowledgeBase.id === selectedKnowledgeBaseId ? "active" : ""}`}
+                  onClick={() => {
+                    setSelectedCategoryId(null);
+                    handleKnowledgeBaseSelection(knowledgeBase.id, false);
+                  }}
+                  title={`打开最近使用知识库：${knowledgeBase.name}`}
+                >
+                  <strong>{knowledgeBase.name}</strong>
+                  <p>
+                    {knowledgeBase.last_opened_at
+                      ? `最近访问：${new Date(knowledgeBase.last_opened_at).toLocaleString("zh-CN")}`
+                      : "暂未访问"}
+                  </p>
+                </button>
+              ))
+            )}
+          </div>
+
+          <div className="sidebar-group">
+            <p className="sidebar-subtitle">最近会话</p>
+            {recentChatSessions.length === 0 ? (
+              <div className="sidebar-note-card">
+                <strong>还没有会话</strong>
+                <p>提问后会自动生成会话，并显示在这里。</p>
+              </div>
+            ) : (
+              recentChatSessions.map((session) => (
+                <button
+                  key={`recent-session-${session.id}`}
+                  type="button"
+                  className={`sidebar-mini-card ${session.id === activeChatSessionId ? "active" : ""}`}
+                  onClick={() => void openChatHistoryModal(session.id)}
+                  title="打开最近会话"
+                >
+                  <strong>{session.title || "未命名会话"}</strong>
+                  <p>
+                    {session.last_message_at
+                      ? `最后提问：${new Date(session.last_message_at).toLocaleString("zh-CN")}`
+                      : "还没有消息"}
+                  </p>
+                </button>
+              ))
+            )}
+          </div>
         </div>
       </aside>
 
@@ -1741,10 +2329,36 @@ function AppWorkspace() {
                       <button
                         type="button"
                         className="ghost-button compact-button"
-                        onClick={() => void deleteSelectedKnowledgeBases()}
-                        title="批量删除所选知识库"
+                        onClick={toggleKnowledgeBaseSelectionMode}
+                        title={knowledgeBaseSelectionMode ? "退出知识库框选模式" : "进入知识库框选模式"}
                       >
-                        批量删除
+                        {knowledgeBaseSelectionMode ? "完成框选" : "框选"}
+                      </button>
+                      <button
+                        type="button"
+                        className="ghost-button compact-button"
+                        onClick={selectAllVisibleKnowledgeBases}
+                        title="勾选当前列表中的全部知识库"
+                        disabled={!knowledgeBaseSelectionMode || selectedKnowledgeBaseIds.length === visibleKnowledgeBases.length}
+                      >
+                        全选
+                      </button>
+                      <button
+                        type="button"
+                        className="ghost-button compact-button"
+                        onClick={clearKnowledgeBaseSelection}
+                        title="取消当前知识库勾选"
+                        disabled={!knowledgeBaseSelectionMode || selectedKnowledgeBaseIds.length === 0}
+                      >
+                        取消
+                      </button>
+                      <button
+                        type="button"
+                        className="ghost-button compact-button"
+                        onClick={() => void deleteSelectedKnowledgeBases()}
+                        title="删除当前框选的全部知识库"
+                      >
+                        删除框选知识库
                       </button>
                       <button
                         type="button"
@@ -1771,7 +2385,16 @@ function AppWorkspace() {
                         移出分类
                       </button>
                     </div>
-                  ) : null}
+                  ) : (
+                    <button
+                      type="button"
+                      className="ghost-button compact-button"
+                      onClick={toggleKnowledgeBaseSelectionMode}
+                      title="进入知识库框选模式"
+                    >
+                      框选
+                    </button>
+                  )}
                   <button
                     type="button"
                     className="plus-action-button"
@@ -1787,6 +2410,14 @@ function AppWorkspace() {
                   {documents.length > 0 ? (
                     <div className="batch-toolbar">
                       <span>{documentSelectionMode ? `${selectedDocumentIds.length} / ${documents.length} 已选` : `${documents.length} 个文件`}</span>
+                      <button
+                        type="button"
+                        className="ghost-button compact-button"
+                        onClick={() => setShowDocumentStatusCenter(true)}
+                        title="查看当前知识库文件解析状态、失败原因和重试入口"
+                      >
+                        状态中心
+                      </button>
                       <button
                         type="button"
                         className="ghost-button compact-button"
@@ -1861,7 +2492,12 @@ function AppWorkspace() {
                       key={knowledgeBase.id}
                       className={`knowledge-base-card ${knowledgeBase.id === selectedKnowledgeBaseId ? "selected" : ""} ${
                         selectedKnowledgeBaseIds.includes(knowledgeBase.id) ? "multi-selected" : ""
-                      }`}
+                      } ${knowledgeBaseSelectionMode ? "selection-mode" : ""}`}
+                      onClick={() => {
+                        if (knowledgeBaseSelectionMode) {
+                          toggleKnowledgeBaseCheckbox(knowledgeBase.id);
+                        }
+                      }}
                       onContextMenu={(event) => {
                         event.preventDefault();
                         setContextTarget({
@@ -1872,21 +2508,32 @@ function AppWorkspace() {
                         });
                       }}
                       title="点击进入该知识库文件列表；右键查看知识库操作"
-                    >
-                      <div className="knowledge-base-card-row">
-                        <label className="selection-box" title="勾选当前知识库">
-                          <input
-                            type="checkbox"
-                            checked={selectedKnowledgeBaseIds.includes(knowledgeBase.id)}
-                            onChange={() => toggleKnowledgeBaseCheckbox(knowledgeBase.id)}
-                            onClick={(event) => event.stopPropagation()}
-                          />
-                          <span />
-                        </label>
+                      >
+                        <div className="knowledge-base-card-row">
+                          {knowledgeBaseSelectionMode ? (
+                            <div className="selection-square" aria-hidden="true">
+                              <span className={selectedKnowledgeBaseIds.includes(knowledgeBase.id) ? "checked" : ""} />
+                            </div>
+                          ) : (
+                            <label className="selection-box" title="勾选当前知识库">
+                              <input
+                                type="checkbox"
+                                checked={selectedKnowledgeBaseIds.includes(knowledgeBase.id)}
+                                onChange={() => toggleKnowledgeBaseCheckbox(knowledgeBase.id)}
+                                onClick={(event) => event.stopPropagation()}
+                              />
+                              <span />
+                            </label>
+                          )}
                         <button
                           type="button"
                           className="knowledge-base-card-main"
-                          onClick={() => handleKnowledgeBaseSelection(knowledgeBase.id, false)}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            if (!knowledgeBaseSelectionMode) {
+                              handleKnowledgeBaseSelection(knowledgeBase.id, false);
+                            }
+                          }}
                         >
                           <div className="knowledge-base-card-top">
                             <strong>{knowledgeBase.name}</strong>
@@ -1908,85 +2555,118 @@ function AppWorkspace() {
                 )}
               </div>
             ) : (
-              <div className="document-panel">
-                <div className="document-preview-head">
-                  <div>
-                    <h3>当前知识库文件</h3>
-                    <p className="muted-copy">
-                      {selectedDocument ? `文件名：${selectedDocument.name}` : "请选择一个文件"}
-                    </p>
+                <div className="document-panel">
+                  <div className="document-preview-head">
+                    <div>
+                      <h3>当前知识库文件</h3>
+                      <p className="muted-copy">
+                        {selectedDocument ? `文件名：${selectedDocument.name}` : "请选择一个文件"}
+                      </p>
+                    </div>
+                    <div className="document-head-tools">
+                      <label className="document-filter">
+                        <span>解析状态</span>
+                        <select
+                          value={documentStatusFilter}
+                          onChange={(event) => setDocumentStatusFilter(event.target.value as DocumentParseFilter)}
+                          title="按解析状态筛选当前知识库文件"
+                        >
+                          <option value="all">全部</option>
+                          <option value="pending">待解析</option>
+                          <option value="processing">解析中</option>
+                          <option value="done">已完成</option>
+                          <option value="failed">失败</option>
+                        </select>
+                      </label>
+                      <span>{filteredDocuments.length}</span>
+                    </div>
                   </div>
-                  <span>{documents.length}</span>
-                </div>
-                {documents.length === 0 ? (
-                  <p className="muted-copy">当前还没有文件，可以使用右上角“+ 上传文件”继续添加。</p>
-                ) : (
-                  <div className="document-preview-list">
-                    {documents.map((document) => (
-                      <div
-                        key={document.id}
-                        className={`document-preview-item ${selectedDocument?.id === document.id ? "selected" : ""} ${
-                          selectedDocumentIds.includes(document.id) ? "multi-selected" : ""
-                        } ${documentSelectionMode ? "selection-mode" : ""}`}
-                        onClick={() => {
-                          if (documentSelectionMode) {
-                            toggleDocumentCheckbox(document);
-                          } else {
-                            handleDocumentSelection(document, false);
-                          }
-                        }}
-                        onMouseEnter={(event) => {
-                          const position = buildHoverPreviewPosition(event.currentTarget.getBoundingClientRect());
-                          setHoverPreview({
-                            documentId: document.id,
-                            x: position.x,
-                            y: position.y,
-                          });
-                        }}
-                        onMouseLeave={() => setHoverPreview((current) => (current?.documentId === document.id ? null : current))}
-                        onContextMenu={(event) => {
-                          event.preventDefault();
-                          setSelectedDocument(document);
-                          setContextTarget({
-                            type: "document",
-                            id: document.id,
-                            x: event.clientX,
-                            y: event.clientY,
-                          });
-                        }}
-                        title="点击查看文件信息；右键查看文件操作"
-                      >
-                        <div className="document-preview-row">
-                          {documentSelectionMode ? (
-                            <div className="selection-square" aria-hidden="true">
-                              <span className={selectedDocumentIds.includes(document.id) ? "checked" : ""} />
-                            </div>
-                          ) : null}
-                          <button
-                            type="button"
-                            className="document-preview-main"
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              if (!documentSelectionMode) {
-                                handleDocumentSelection(document, false);
-                              }
-                            }}
-                          >
-                            <div>
-                              <strong>{document.name}</strong>
-                              <p>
-                                {document.source_type === "url" ? "网页链接" : document.file_type.toUpperCase()} · {document.parse_status}
-                              </p>
-                              <p>上传时间：{new Date(document.created_at).toLocaleString("zh-CN")}</p>
-                            </div>
-                          </button>
+                  {documents.length === 0 ? (
+                    <p className="muted-copy">当前还没有文件，可以使用右上角“+ 上传文件”继续添加。</p>
+                  ) : filteredDocuments.length === 0 ? (
+                    <div className="empty-card compact-empty-card">
+                      <strong>当前筛选条件下没有文件</strong>
+                      <p>可以切回“全部”或更换解析状态筛选。</p>
+                    </div>
+                  ) : (
+                    <div className="document-panel-layout">
+                      <div className="document-preview-list">
+                        {filteredDocuments.map((document) => (
+                        <div
+                          key={document.id}
+                          className={`document-preview-item ${selectedDocument?.id === document.id ? "selected" : ""} ${
+                            selectedDocumentIds.includes(document.id) ? "multi-selected" : ""
+                          } ${documentSelectionMode ? "selection-mode" : ""}`}
+                          onClick={() => {
+                            if (documentSelectionMode) {
+                              toggleDocumentCheckbox(document);
+                            } else {
+                              handleDocumentSelection(document, false);
+                            }
+                          }}
+                          onMouseEnter={() => setHoveredDocumentId(document.id)}
+                          onMouseLeave={() => setHoveredDocumentId((current) => (current === document.id ? null : current))}
+                          onContextMenu={(event) => {
+                            event.preventDefault();
+                            setSelectedDocument(document);
+                            setContextTarget({
+                              type: "document",
+                              id: document.id,
+                              x: event.clientX,
+                              y: event.clientY,
+                            });
+                          }}
+                          title="点击查看文件信息；右键查看文件操作"
+                        >
+                          <div className="document-preview-row">
+                            {documentSelectionMode ? (
+                              <div className="selection-square" aria-hidden="true">
+                                <span className={selectedDocumentIds.includes(document.id) ? "checked" : ""} />
+                              </div>
+                            ) : null}
+                            <button
+                              type="button"
+                              className="document-preview-main"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                if (!documentSelectionMode) {
+                                  handleDocumentSelection(document, false);
+                                }
+                              }}
+                            >
+                              <div>
+                                <strong>{document.name}</strong>
+                                <p>
+                                  {document.source_type === "url" ? "网页链接" : document.file_type.toUpperCase()} · {document.parse_status}
+                                </p>
+                                <p>上传时间：{new Date(document.created_at).toLocaleString("zh-CN")}</p>
+                              </div>
+                            </button>
+                          </div>
                         </div>
+                        ))}
                       </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
+                      {summaryDocument ? (
+                        <div className="document-summary-card preview-block">
+                          <strong>文档摘要</strong>
+                          <p className="muted-copy">
+                            {summaryDocument.summary_text?.trim() || "当前文档还没有生成摘要。可尝试在“状态中心”或知识库右键中重新解析/重新索引。"}
+                          </p>
+                          <div className="document-status-row document-summary-meta">
+                            <span className={`status-pill status-${summaryDocument.parse_status}`}>{summaryDocument.parse_status}</span>
+                            <span className="muted-copy">
+                              {summaryDocument.source_type === "url" ? "网页来源" : `${summaryDocument.file_type.toUpperCase()} 文件`}
+                            </span>
+                            <span className="muted-copy">
+                              更新于：{new Date(summaryDocument.updated_at).toLocaleString("zh-CN")}
+                            </span>
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+                  )}
+                </div>
+              )}
           </div>
         </section>
 
@@ -1994,50 +2674,186 @@ function AppWorkspace() {
           <header className="chat-board-head">
             <div>
               <p className="section-kicker">知识库问答</p>
-              <h2>{selectedKnowledgeBase?.name || "请选择一个知识库"}</h2>
+              <h2>{effectiveQuestionKnowledgeBaseLabel || "请选择一个知识库"}</h2>
             </div>
           </header>
 
           <div className="chat-board-body">
-            {selectedKnowledgeBase ? (
-              <>
-                <div className="qa-panel">
+            {effectiveQuestionKnowledgeBases.length > 0 ? (
+              <div className="chat-layout">
+                <aside className="chat-session-sidebar left-nav-column">
+                  <div className="chat-session-sidebar-head">
+                    <strong>知识库会话</strong>
+                    <span>
+                      {chatSessionSearch.trim()
+                        ? chatSearchLoading
+                          ? "检索中"
+                          : chatSearchResults.length
+                        : loadingChatSessions
+                          ? "加载中"
+                          : visibleChatSessions.length}
+                    </span>
+                  </div>
+                  <label className="chat-session-search" title="跨全部知识库会话搜索问答">
+                    <input
+                      type="search"
+                      value={chatSessionSearch}
+                      onChange={(event) => setChatSessionSearch(event.target.value)}
+                      placeholder="搜索全部会话中的问题或回答"
+                    />
+                  </label>
+                  <div className="chat-session-list">
+                    {chatSessionSearch.trim() ? (
+                      chatSearchLoading ? (
+                        <div className="chat-session-empty">
+                          <strong>正在检索问答记录</strong>
+                          <p>正在跨全部知识库会话搜索问题和回答内容。</p>
+                        </div>
+                      ) : chatSearchResults.length === 0 ? (
+                        <div className="chat-session-empty">
+                          <strong>没有匹配结果</strong>
+                          <p>换个关键词再试试，支持搜问题内容和回答内容。</p>
+                        </div>
+                      ) : (
+                        chatSearchResults.map((result) => (
+                          <button
+                            key={`${result.sessionId}-${result.messageId}`}
+                            type="button"
+                            className="chat-search-result-card"
+                            onClick={() => void openChatHistoryFromSearch(result)}
+                            title="打开该条问答所在会话的完整记录"
+                          >
+                            <div className="chat-session-item-head">
+                              <strong>{result.knowledgeBaseName}</strong>
+                              <span className="chat-recent-badge">命中</span>
+                            </div>
+                            <p className="chat-search-question">问：{result.question}</p>
+                            <p className="chat-search-answer">答：{result.answer}</p>
+                            <p>{new Date(result.createdAt).toLocaleString("zh-CN")}</p>
+                          </button>
+                        ))
+                      )
+                    ) : visibleChatSessions.length === 0 ? (
+                      <div className="chat-session-empty">
+                        <strong>还没有问答记录</strong>
+                        <p>你第一次提问后，这里会保留这个知识库的完整问答历史。</p>
+                      </div>
+                    ) : (
+                      visibleChatSessions.map((session) => (
+                          <button
+                            key={session.id}
+                            type="button"
+                            className={`chat-session-item recent ${session.id === activeChatSessionId ? "active" : ""}`}
+                            onClick={() => void openChatHistoryModal(session.id)}
+                            onContextMenu={(event) => {
+                              event.preventDefault();
+                              setContextTarget({
+                                type: "chatSession",
+                                id: session.id,
+                                x: event.clientX,
+                                y: event.clientY,
+                              });
+                            }}
+                          >
+                            <div className="chat-session-item-head">
+                              <strong>{effectiveQuestionKnowledgeBaseLabel || session.title || "当前知识库会话"}</strong>
+                              <span className="chat-recent-badge">当前</span>
+                            </div>
+                            <p>
+                              {session.last_message_at
+                                ? `最后提问：${new Date(session.last_message_at).toLocaleString("zh-CN")}`
+                                : "还没有消息"}
+                            </p>
+                          </button>
+                        ))
+                    )}
+                  </div>
+                </aside>
+
+                <div className="qa-panel center-qa-column">
                   <div className="document-detail-card qa-card">
                     <div className="document-preview-head">
                       <div>
                         <h3>问答窗口</h3>
-                        <p className="muted-copy">当前仅在知识库“{selectedKnowledgeBase.name}”内检索，不会串到其他库。</p>
                       </div>
                     </div>
-                    <div className="qa-input-row">
-                      <textarea
-                        value={questionDraft}
-                        onChange={(event) => setQuestionDraft(event.target.value)}
-                        placeholder="例如：这份资料里对行动者网络理论是怎么定义的？"
-                        rows={4}
-                      />
-                      <div className="qa-action-row">
-                        <button
-                          type="button"
-                          className="primary-button"
-                          onClick={() => void askKnowledgeBaseQuestion()}
-                          disabled={loading}
-                          title="基于当前知识库发起单轮问答"
-                        >
-                          提问
-                        </button>
-                      </div>
+
+                    <div className="chat-history-panel">
+                      {activeChatMessages.length === 0 ? (
+                        <div className="chat-empty qa-empty-state">
+                          <strong>当前还没有历史消息</strong>
+                          <p>输入一个问题后点击“提问”，系统会在当前会话内持续保存追问历史。</p>
+                        </div>
+                      ) : (
+                        <div className="chat-message-list">
+                          {activeChatMessages.map((message) => {
+                            const citations = parseJsonArray<QACitation>(message.citations_json);
+                            return (
+                              <div key={message.id} className={`chat-message-card ${message.role === "user" ? "user" : "assistant"}`}>
+                                <div className="chat-message-meta">
+                                  <strong>{message.role === "user" ? "你" : "AI"}</strong>
+                                  <span>{new Date(message.created_at).toLocaleString("zh-CN")}</span>
+                                </div>
+                                {message.role === "user" ? (
+                                  <p className="chat-message-text">{message.question_text || ""}</p>
+                                ) : (
+                                  <>
+                                    <p className="chat-message-text">{message.answer_markdown || ""}</p>
+                                    {citations.length > 0 ? (
+                                      <div className="chat-inline-citations">
+                                        {citations.map((citation) => (
+                                          <button
+                                            key={`${message.id}-${citation.document_id}-${citation.location_label}`}
+                                            type="button"
+                                            className="qa-chip qa-chip-button"
+                                            onClick={() => reopenAnswerFromHistory(message)}
+                                            title="重新打开这条回答的来源详情"
+                                          >
+                                            {citation.document_name}
+                                          </button>
+                                        ))}
+                                      </div>
+                                    ) : null}
+                                  </>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
                     </div>
-                    {error ? <p className="error-text modal-error qa-inline-error">{error}</p> : null}
-                    {!qaResult ? (
-                      <div className="chat-empty qa-empty-state">
-                        <strong>当前还没有问答结果</strong>
-                        <p>输入一个问题后点击“提问”，系统会在当前选中知识库内检索并返回带来源的答案。</p>
+
+                    <div className="qa-composer">
+                      {isAnswering ? (
+                        <div className="qa-answering-hint" aria-live="polite">
+                          <span className="qa-answering-dot" aria-hidden="true" />
+                          <span>正在回答，请等待…</span>
+                        </div>
+                      ) : null}
+                      <div className="qa-input-row">
+                        <textarea
+                          value={questionDraft}
+                          onChange={(event) => setQuestionDraft(event.target.value)}
+                          placeholder="例如：这份资料里对行动者网络理论是怎么定义的？如果当前选中了多个知识库，将自动跨知识库联合问答。"
+                          rows={3}
+                        />
+                        <div className="qa-action-row">
+                          <button
+                            type="button"
+                            className="primary-button qa-submit-button"
+                            onClick={() => void askKnowledgeBaseQuestion()}
+                            disabled={isAnswering}
+                            title="基于当前选中知识库和当前会话继续问答"
+                          >
+                            {isAnswering ? "回答中..." : "提问"}
+                          </button>
+                        </div>
                       </div>
-                    ) : null}
+                      {error ? <p className="error-text modal-error qa-inline-error">{error}</p> : null}
+                    </div>
                   </div>
                 </div>
-              </>
+              </div>
             ) : (
               <div className="chat-empty">
                 <strong>先选择一个知识库</strong>
@@ -2048,13 +2864,6 @@ function AppWorkspace() {
         </section>
       </main>
 
-      {hoverPreview && hoveredDocumentPreview ? (
-        <div className="document-hover-preview floating" style={{ left: hoverPreview.x, top: hoverPreview.y }}>
-          <strong>{hoveredDocumentPreview.name}</strong>
-          <p>{hoveredDocumentPreview.preview}</p>
-        </div>
-      ) : null}
-
       {qaResult ? (
         <div className="qa-result-overlay">
           <div className="qa-result-modal">
@@ -2062,7 +2871,7 @@ function AppWorkspace() {
               <div>
                 <strong>回答结果</strong>
                 <p className="muted-copy">
-                  {qaMeta?.knowledgeBaseName ? `当前知识库：${qaMeta.knowledgeBaseName}` : selectedKnowledgeBase ? `当前知识库：${selectedKnowledgeBase.name}` : "当前知识库问答"}
+                  {qaMeta?.knowledgeBaseName ? `当前知识库：${qaMeta.knowledgeBaseName}` : effectiveQuestionKnowledgeBaseLabel ? `当前知识库：${effectiveQuestionKnowledgeBaseLabel}` : "当前知识库问答"}
                 </p>
                 {shareCode ? <p className="muted-copy">分享码：{shareCode}</p> : null}
               </div>
@@ -2070,36 +2879,36 @@ function AppWorkspace() {
                 <button type="button" className="secondary-button qa-tool-button" onClick={() => void copyAnswerText()} title="只复制答案正文">
                   复制答案
                 </button>
-                <div className="qa-share-group">
-                  <button
-                    type="button"
-                    className="ghost-button qa-tool-button"
-                    onClick={() => setShareMenuOpen((current) => !current)}
-                    title="选择分享方式"
-                  >
-                    分享答案
-                  </button>
-                  {shareMenuOpen ? (
-                    <div className="qa-share-panel">
-                      <button type="button" onClick={downloadShareImage}>
-                        生成长图
-                      </button>
-                      <button type="button" onClick={() => downloadMindMap("landscape")}>
-                        横版思维导图
-                      </button>
-                      <button type="button" onClick={() => downloadMindMap("portrait")}>
-                        竖版思维导图
-                      </button>
-                    </div>
-                  ) : null}
-                </div>
+                <button
+                  type="button"
+                  className="secondary-button qa-tool-button"
+                  onClick={() => void exportAnswerAsMarkdown()}
+                  title="将当前问题、回答和来源导出为 Markdown"
+                >
+                  Markdown 导出
+                </button>
+                <button
+                  type="button"
+                  className="secondary-button qa-tool-button"
+                  onClick={() => void exportAnswerAsDocx()}
+                  title="将当前问题、回答和来源导出为 DOCX"
+                >
+                  DOCX 导出
+                </button>
+                <button
+                  type="button"
+                  className="ghost-button qa-tool-button"
+                  onClick={downloadShareImage}
+                  title="生成并下载答案分享图片"
+                >
+                  分享答案
+                </button>
                 <button
                   type="button"
                   className="modal-close"
                   onClick={() => {
                     setQaResult(null);
                     setQaMeta(null);
-                    setShareMenuOpen(false);
                   }}
                   title="关闭回答窗口"
                 >
@@ -2132,7 +2941,13 @@ function AppWorkspace() {
                 {qaResult.citations.length > 0 ? (
                   <div className="qa-citation-list">
                     {qaResult.citations.map((citation) => (
-                      <div key={`${citation.document_id}-${citation.location_label}-${citation.score}`} className="qa-citation-card">
+                      <button
+                        key={`${citation.document_id}-${citation.location_label}-${citation.score}`}
+                        type="button"
+                        className="qa-citation-card qa-citation-button"
+                        onClick={() => setActiveCitation(citation)}
+                        title="打开该来源片段并查看高亮命中内容"
+                      >
                         <div className="qa-citation-head">
                           <strong>{citation.document_name}</strong>
                           <span>{citation.location_label}</span>
@@ -2141,7 +2956,7 @@ function AppWorkspace() {
                         <p className="muted-copy qa-citation-text">
                           来源知识库：{citation.knowledge_base_name} · 匹配分数：{citation.score.toFixed(2)}
                         </p>
-                      </div>
+                      </button>
                     ))}
                   </div>
                 ) : (
@@ -2205,6 +3020,16 @@ function AppWorkspace() {
               <button type="button" onClick={() => duplicateKnowledgeBase(contextTarget.id)} title="复制当前知识库配置">
                 复制知识库
               </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const knowledgeBase = knowledgeBases.find((item) => item.id === contextTarget.id);
+                  if (knowledgeBase) void reindexKnowledgeBase(knowledgeBase);
+                }}
+                title="重建当前知识库的解析结果与向量索引"
+              >
+                重新索引
+              </button>
               <button type="button" onClick={() => openKnowledgeBaseCategoryModal("move", [contextTarget.id])} title="把知识库移动到其他分类">
                 移动到分类
               </button>
@@ -2215,8 +3040,52 @@ function AppWorkspace() {
                 移出分类
               </button>
             </>
+          ) : contextTarget.type === "chatSession" ? (
+            <>
+              <button
+                type="button"
+                onClick={() => {
+                  void renameChatSession(contextTarget.id);
+                }}
+                title="修改当前会话名称"
+              >
+                重命名会话
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  void clearChatSession(contextTarget.id);
+                }}
+                title="清空当前会话历史消息"
+              >
+                清空会话
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  void deleteChatSession(contextTarget.id);
+                }}
+                title="删除当前会话"
+              >
+                删除会话
+              </button>
+            </>
           ) : (
             <>
+              <button
+                type="button"
+                onClick={() => {
+                  const document = documents.find((item) => item.id === contextTarget.id);
+                  if (!document) return;
+                  setSelectedDocument(document);
+                  void retryParseDocument(document);
+                  setContextTarget(null);
+                }}
+                title="对待解析或解析失败的文件继续执行解析"
+                disabled={documents.find((item) => item.id === contextTarget.id)?.parse_status === "processing"}
+              >
+                解析文件
+              </button>
               <button
                 type="button"
                 onClick={() => {
@@ -2550,6 +3419,214 @@ function AppWorkspace() {
         </div>
       ) : null}
 
+      {showChatHistoryModal ? (
+        <div className="modal-backdrop" onClick={() => setShowChatHistoryModal(false)}>
+          <div className="modal-card chat-history-modal" onClick={(event) => event.stopPropagation()}>
+            <header className="modal-head">
+              <div>
+                <p className="card-kicker">知识库问答历史</p>
+                <h3>{selectedKnowledgeBase?.name || activeChatSession?.title || "当前知识库问答"}</h3>
+              </div>
+              <button
+                type="button"
+                className="modal-close"
+                onClick={() => setShowChatHistoryModal(false)}
+                title="关闭当前弹窗"
+              >
+                ×
+              </button>
+            </header>
+            <div className="chat-history-modal-body">
+              {activeChatMessages.length === 0 ? (
+                <div className="chat-empty qa-empty-state">
+                  <strong>当前还没有历史消息</strong>
+                  <p>在右下问答窗口提问后，这里会保留这个知识库的全部问答历史。</p>
+                </div>
+              ) : (
+                <div className="chat-message-list">
+                  {activeChatMessages.map((message) => {
+                    const citations = parseJsonArray<QACitation>(message.citations_json);
+                    return (
+                      <div key={`modal-${message.id}`} className={`chat-message-card ${message.role === "user" ? "user" : "assistant"}`}>
+                        <div className="chat-message-meta">
+                          <strong>{message.role === "user" ? "你" : "AI"}</strong>
+                          <span>{new Date(message.created_at).toLocaleString("zh-CN")}</span>
+                        </div>
+                        {message.role === "user" ? (
+                          <p className="chat-message-text">{message.question_text || ""}</p>
+                        ) : (
+                          <>
+                            <p className="chat-message-text">{message.answer_markdown || ""}</p>
+                            {citations.length > 0 ? (
+                              <div className="chat-inline-citations">
+                                {citations.map((citation) => (
+                                  <button
+                                    key={`modal-${message.id}-${citation.document_id}-${citation.location_label}`}
+                                    type="button"
+                                    className="qa-chip qa-chip-button"
+                                    onClick={() => reopenAnswerFromHistory(message)}
+                                    title="重新打开这条回答的来源详情"
+                                  >
+                                    {citation.document_name}
+                                  </button>
+                                ))}
+                              </div>
+                            ) : null}
+                          </>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {selectedChatSearchHit ? (
+        <div className="modal-backdrop" onClick={() => setSelectedChatSearchHit(null)}>
+          <div className="modal-card chat-history-modal" onClick={(event) => event.stopPropagation()}>
+            <header className="modal-head">
+              <div>
+                <p className="card-kicker">命中问答</p>
+                <h3>{selectedChatSearchHit.knowledgeBaseName}</h3>
+              </div>
+              <button
+                type="button"
+                className="modal-close"
+                onClick={() => setSelectedChatSearchHit(null)}
+                title="关闭当前弹窗"
+              >
+                ×
+              </button>
+            </header>
+            <div className="chat-history-modal-body">
+              <div className="chat-message-card user">
+                <div className="chat-message-meta">
+                  <strong>问</strong>
+                  <span>{new Date(selectedChatSearchHit.createdAt).toLocaleString("zh-CN")}</span>
+                </div>
+                <p className="chat-message-text">{selectedChatSearchHit.question}</p>
+              </div>
+              <div className="chat-message-card assistant">
+                <div className="chat-message-meta">
+                  <strong>答</strong>
+                  <span>命中结果</span>
+                </div>
+                <p className="chat-message-text">{selectedChatSearchHit.displayAnswer}</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {showDocumentStatusCenter ? (
+        <div className="modal-backdrop" onClick={() => setShowDocumentStatusCenter(false)}>
+          <div className="modal-card chat-history-modal" onClick={(event) => event.stopPropagation()}>
+            <header className="modal-head">
+              <div>
+                <p className="card-kicker">文件解析状态中心</p>
+                <h3>{selectedKnowledgeBase?.name || "当前知识库"}</h3>
+              </div>
+              <button
+                type="button"
+                className="modal-close"
+                onClick={() => setShowDocumentStatusCenter(false)}
+                title="关闭状态中心"
+              >
+                ×
+              </button>
+            </header>
+            <div className="chat-history-modal-body">
+              {documents.length === 0 ? (
+                <div className="chat-empty qa-empty-state">
+                  <strong>当前还没有文件</strong>
+                  <p>上传文件后，这里会显示各文件的解析状态与失败原因。</p>
+                </div>
+              ) : (
+                <div className="document-detail-list">
+                  {documents.map((document) => (
+                    <div key={`status-${document.id}`} className="preview-block">
+                      <strong>{document.name}</strong>
+                      <div className="document-status-row">
+                        <span className={`status-pill status-${document.parse_status}`}>{document.parse_status}</span>
+                        <span className="muted-copy">重试次数：{document.retry_count}</span>
+                      </div>
+                      <p className="muted-copy">
+                        {document.parse_error ? `失败原因：${document.parse_error}` : "当前没有失败原因。"}
+                      </p>
+                      <div className="modal-actions">
+                        <button
+                          type="button"
+                          className="secondary-button compact-button"
+                          onClick={() => retryParseDocument(document)}
+                          title="重新触发当前文件解析"
+                        >
+                          重新解析
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {activeCitation ? (
+        <div className="modal-backdrop" onClick={() => setActiveCitation(null)}>
+          <div className="modal-card chat-history-modal" onClick={(event) => event.stopPropagation()}>
+            <header className="modal-head">
+              <div>
+                <p className="card-kicker">命中片段高亮</p>
+                <h3>{activeCitation.document_name}</h3>
+              </div>
+              <button
+                type="button"
+                className="modal-close"
+                onClick={() => setActiveCitation(null)}
+                title="关闭高亮片段弹窗"
+              >
+                ×
+              </button>
+            </header>
+            <div className="chat-history-modal-body">
+              <div className="preview-block">
+                <strong>{activeCitation.knowledge_base_name}</strong>
+                <p className="muted-copy">{activeCitation.location_label}</p>
+                <p className="qa-highlight-text">
+                  {renderHighlightedSnippet(activeCitation.snippet, activeCitation.highlight_ranges)}
+                </p>
+                <div className="modal-actions">
+                  <button
+                    type="button"
+                    className="secondary-button compact-button"
+                    onClick={() => {
+                      const sourceDocument = activeCitationDocument;
+                      if (!sourceDocument) {
+                        setToast("当前来源文件未在列表中找到");
+                        return;
+                      }
+                      setSelectedDocument(sourceDocument);
+                      if (sourceDocument.source_type === "url" && sourceDocument.source_url) {
+                        window.open(sourceDocument.source_url, "_blank", "noopener,noreferrer");
+                        return;
+                      }
+                      openSelectedDocument();
+                    }}
+                    title="打开当前引用对应的原始文件或网页"
+                  >
+                    {activeCitationDocument?.source_type === "url" ? "打开网页来源" : "打开原始文件"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       {toast ? <div className="toast">{toast}</div> : null}
     </div>
   );
@@ -2557,19 +3634,27 @@ function AppWorkspace() {
 
 function SettingsPage() {
   const [config, setConfig] = useState<SystemConfig | null>(null);
+  const [llmStatus, setLlmStatus] = useState<LLMStatus | null>(null);
+  const [loadingStatus, setLoadingStatus] = useState(true);
   const [error, setError] = useState("");
 
   useEffect(() => {
-    async function loadConfig() {
+    async function loadSettings() {
       try {
-        const currentConfig = await requestJson<SystemConfig>("/system/config");
+        const [currentConfig, currentStatus] = await Promise.all([
+          requestJson<SystemConfig>("/system/config"),
+          requestJson<LLMStatus>("/system/llm-status"),
+        ]);
         setConfig(currentConfig);
+        setLlmStatus(currentStatus);
       } catch (err) {
         setError(err instanceof Error ? err.message : "加载失败");
+      } finally {
+        setLoadingStatus(false);
       }
     }
 
-    void loadConfig();
+    void loadSettings();
   }, []);
 
   return (
@@ -2602,6 +3687,54 @@ function SettingsPage() {
             <div className="settings-item">
               <span>模型配置</span>
               <strong>{config.model_config_name}</strong>
+            </div>
+            <div className="settings-item">
+              <span>模型启用</span>
+              <strong>{config.llm_enabled ? "已启用" : "未启用"}</strong>
+            </div>
+            <div className="settings-item">
+              <span>模型 Provider</span>
+              <strong>{config.llm_provider}</strong>
+            </div>
+            <div className="settings-item">
+              <span>模型名称</span>
+              <strong>{config.llm_model_name}</strong>
+            </div>
+            <div className="settings-item full">
+              <span>模型服务地址</span>
+              <code>{config.llm_base_url}</code>
+            </div>
+            <div className="settings-item">
+              <span>响应超时</span>
+              <strong>{config.llm_timeout_seconds} 秒</strong>
+            </div>
+            <div className="settings-item">
+              <span>回退策略</span>
+              <strong>{config.llm_fallback_to_extractive ? "开启抽取式回退" : "仅使用模型回答"}</strong>
+            </div>
+            <div className="settings-item full llm-status-card">
+              <span>模型状态</span>
+              {llmStatus ? (
+                <div className="llm-status-content">
+                  <div className="llm-status-head">
+                    <strong>{llmStatus.available ? "Qwen 已连接" : "Qwen 未就绪"}</strong>
+                    <span
+                      className={`status-pill ${
+                        llmStatus.available ? "status-done" : llmStatus.reachable ? "status-processing" : "status-failed"
+                      }`}
+                    >
+                      {llmStatus.available ? "可用" : llmStatus.reachable ? "服务在线" : "服务不可达"}
+                    </span>
+                  </div>
+                  <p className="muted-copy llm-status-message">{llmStatus.message}</p>
+                  <div className="llm-status-meta">
+                    <code>{llmStatus.provider}</code>
+                    <code>{llmStatus.model}</code>
+                  </div>
+                </div>
+              ) : (
+                <p className="muted-copy">{loadingStatus ? "正在检查本地模型状态..." : "模型状态读取失败"}</p>
+              )}
             </div>
             <div className="settings-item full">
               <span>数据库路径</span>

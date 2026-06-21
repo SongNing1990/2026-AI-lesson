@@ -21,7 +21,6 @@ from app.repositories.documents import (
     get_document,
     list_document_chunks,
     list_documents,
-    replace_document_chunks,
     update_document_knowledge_base,
 )
 from app.repositories.knowledge_bases import get_knowledge_base, utc_now
@@ -37,56 +36,11 @@ from app.schemas.documents import (
 )
 from app.schemas.knowledge_bases import DeleteResponse
 from app.services.document_uploads import build_storage_path, detect_file_type, guess_mime_type
-from app.services.document_parsers import (
-    build_preview_text,
-    build_summary_placeholder,
-    chunk_segments,
-    load_text_from_document,
-)
-from app.services.vector_store import delete_document_vectors, sync_document_vectors
+from app.services.document_indexing import parse_and_index_document
+from app.services.vector_store import delete_document_vectors
 from app.services.web_imports import build_fetch_candidates, fetch_webpage, normalize_url
 
 router = APIRouter(prefix="/documents", tags=["documents"])
-
-
-def parse_and_index_document(document: Document, session: Session) -> Document:
-    document.parse_status = "processing"
-    document.parse_error = None
-    session.add(document)
-    session.commit()
-
-    try:
-        segments = load_text_from_document(document, get_project_root())
-        document.preview_text = build_preview_text(segments)
-        document.summary_text = build_summary_placeholder(segments) or None
-        document.page_count = len({segment.page_number for segment in segments if segment.page_number is not None}) or None
-        chunks = chunk_segments(document, segments)
-        replace_document_chunks(session, document.id, chunks)
-        knowledge_base = get_knowledge_base(session, document.knowledge_base_id)
-        if knowledge_base is not None:
-            sync_document_vectors(
-                knowledge_base_name=knowledge_base.name,
-                document_name=document.name,
-                document_id=document.id,
-                knowledge_base_id=document.knowledge_base_id,
-                chunks=chunks,
-            )
-        document.parse_status = "done"
-        document.parse_error = None
-        document.last_parsed_at = utc_now()
-        document.updated_at = utc_now()
-        session.add(document)
-        session.commit()
-        session.refresh(document)
-        return document
-    except Exception as exc:
-        document.parse_status = "failed"
-        document.parse_error = str(exc)
-        document.updated_at = utc_now()
-        session.add(document)
-        session.commit()
-        session.refresh(document)
-        raise
 
 
 def import_urls_to_documents(
@@ -228,6 +182,13 @@ def resolve_document_path(document: Document) -> Path:
     path = get_project_root() / document.storage_path
     if not path.exists() or not path.is_file():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Stored file not found.")
+    return path
+
+
+def resolve_document_path_if_exists(document: Document) -> Optional[Path]:
+    path = get_project_root() / document.storage_path
+    if not path.exists() or not path.is_file():
+        return None
     return path
 
 
@@ -451,7 +412,7 @@ def delete_document(document_id: str, session: Session = Depends(get_db_session)
 
     file_path: Optional[Path] = None
     if document.source_type != "url":
-        file_path = resolve_document_path(document)
+        file_path = resolve_document_path_if_exists(document)
 
     deleted = delete_document_record(session, document_id)
     if not deleted:

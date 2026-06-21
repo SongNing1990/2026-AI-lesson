@@ -4,7 +4,9 @@ from fastapi.responses import HTMLResponse
 
 from app.core.config import get_settings
 from app.core.db import get_database_path, init_db
+from app.routers.chat import router as chat_router
 from app.routers.documents import router as documents_router
+from app.routers.exports import router as exports_router
 from app.routers.knowledge_bases import router as knowledge_bases_router
 from app.core.paths import ensure_runtime_dirs
 from app.routers.qa import router as qa_router
@@ -22,6 +24,8 @@ app.add_middleware(
 )
 app.include_router(knowledge_bases_router)
 app.include_router(documents_router)
+app.include_router(chat_router)
+app.include_router(exports_router)
 app.include_router(qa_router)
 app.include_router(system_router)
 

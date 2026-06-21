@@ -15,9 +15,11 @@ from app.repositories.knowledge_bases import (
     list_recent_knowledge_bases,
     utc_now,
 )
+from app.services.document_indexing import reindex_knowledge_base_documents
 from app.schemas.knowledge_bases import (
     DeleteResponse,
     KnowledgeBaseCreate,
+    KnowledgeBaseReindexResponse,
     KnowledgeBaseResponse,
     KnowledgeBaseUpdate,
 )
@@ -121,3 +123,19 @@ def delete_knowledge_base(
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Knowledge base not found.")
     return DeleteResponse(success=True, deleted_id=knowledge_base_id)
+
+
+@router.post("/{knowledge_base_id}/reindex", response_model=KnowledgeBaseReindexResponse)
+def reindex_knowledge_base(
+    knowledge_base_id: str,
+    session: Session = Depends(get_db_session),
+) -> KnowledgeBaseReindexResponse:
+    if get_knowledge_base(session, knowledge_base_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Knowledge base not found.")
+
+    try:
+        result = reindex_knowledge_base_documents(knowledge_base_id, session)
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+
+    return KnowledgeBaseReindexResponse(**result)

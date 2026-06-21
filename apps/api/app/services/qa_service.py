@@ -1,20 +1,39 @@
 import re
+import json
 from collections import OrderedDict
 from dataclasses import dataclass
 from difflib import SequenceMatcher
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
+from uuid import uuid4
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.models.chat_messages import ChatMessage
+from app.models.chat_sessions import ChatSession
+from app.models.document_chunks import DocumentChunk
+from app.models.documents import Document
 from app.models.knowledge_bases import KnowledgeBase
+from app.core.config import get_settings
+from app.repositories.chat import create_chat_message, create_chat_session, get_chat_session, list_recent_chat_messages, parse_selected_kb_ids, update_chat_session
 from app.repositories.knowledge_bases import get_knowledge_base
 from app.schemas.qa import CitationHighlightRange, QACitation, QAAskResponse, QAMatchedDocument
+from app.repositories.knowledge_bases import utc_now
+from app.services.llm_client import (
+    LLMClientError,
+    LLMEmptyResponseError,
+    LLMModelNotFoundError,
+    LLMRequestTimeoutError,
+    LLMServiceUnavailableError,
+    generate_text,
+)
+from app.services.llm_prompting import build_qa_prompts
 from app.services.text_vectors import extract_terms
 from app.services.vector_store import backfill_vectors_for_knowledge_bases, query_vectors
 
 
 MIN_EVIDENCE_SCORE = 0.18
-MAX_CITATIONS = 3
+MAX_CITATIONS = 4
 FUZZY_TERM_MATCH_THRESHOLD = 0.56
 MIN_VECTOR_ONLY_SCORE = 0.62
 RELATIVE_HIT_SCORE_THRESHOLD = 0.45
@@ -94,6 +113,7 @@ SUBJECT_STOP_TERMS = {
 }
 SUBJECT_BOOST = 0.22
 SUBJECT_PENALTY = 0.18
+MAX_CONTEXT_MESSAGES = 6
 
 
 @dataclass
@@ -110,11 +130,23 @@ class RetrievalHit:
     combined_score: float
 
 
+@dataclass
+class RetrievalCandidate:
+    knowledge_base_id: str
+    knowledge_base_name: str
+    document_id: str
+    document_name: str
+    location_label: str
+    text: str
+    vector_distance: float
+
+
 def ask_question(
     session: Session,
     question: str,
     knowledge_base_ids: Sequence[str],
     top_k: int,
+    session_id: Optional[str] = None,
 ) -> QAAskResponse:
     normalized_question = question.strip()
     if not normalized_question:
@@ -124,33 +156,169 @@ def ask_question(
             matched_documents=[],
             answer_limited=True,
             message="问题不能为空。",
+            session_id=session_id,
         )
 
-    knowledge_bases = validate_knowledge_bases(session, knowledge_base_ids)
-    backfill_vectors_for_knowledge_bases(session, knowledge_base_ids)
-    raw_results = query_vectors(knowledge_base_ids, normalized_question, max(top_k * 4, top_k + 6))
-    hits = rerank_hits(raw_results, normalized_question)
+    active_session: Optional[ChatSession] = None
+    effective_knowledge_base_ids = list(knowledge_base_ids)
+    if session_id:
+        active_session = get_chat_session(session, session_id)
+        if active_session is None:
+            raise ValueError(f"Chat session not found: {session_id}")
+        if not effective_knowledge_base_ids:
+            effective_knowledge_base_ids = parse_selected_kb_ids(active_session)
+    if not effective_knowledge_base_ids:
+        return QAAskResponse(
+            answer="未找到足够依据，无法回答当前问题。",
+            citations=[],
+            matched_documents=[],
+            answer_limited=True,
+            message="知识库范围不能为空。",
+            session_id=session_id,
+        )
+
+    contextual_question = build_contextual_question(session, session_id, normalized_question)
+    knowledge_bases = validate_knowledge_bases(session, effective_knowledge_base_ids)
+    backfill_vectors_for_knowledge_bases(session, effective_knowledge_base_ids)
+    hits, raw_results = retrieve_ranked_hits(
+        session=session,
+        knowledge_base_ids=effective_knowledge_base_ids,
+        question=contextual_question,
+        top_k=top_k,
+    )
 
     if not hits or hits[0].combined_score < MIN_EVIDENCE_SCORE:
-        return QAAskResponse(
+        response = QAAskResponse(
             answer="未找到足够依据，当前选定知识库内没有足够证据支持回答这个问题。",
             citations=[],
             matched_documents=[],
             answer_limited=True,
             message="请尝试更换知识库范围、补充文档，或换一种问法。",
+            session_id=active_session.id if active_session else None,
         )
+        persist_chat_turn(session, active_session, normalized_question, response, raw_results)
+        touch_knowledge_bases(session, effective_knowledge_base_ids)
+        return response
 
     top_hits = select_top_hits(hits)
     citations = [build_citation(hit, normalized_question) for hit in top_hits]
     matched_documents = build_matched_documents(top_hits)
+    generated_answer, used_fallback, fallback_message = generate_answer_with_qwen(
+        question=normalized_question,
+        knowledge_base_names=[item.name for item in knowledge_bases.values()],
+        citations=citations,
+    )
 
-    return QAAskResponse(
-        answer=build_answer(normalized_question, citations),
+    response = QAAskResponse(
+        answer=generated_answer,
         citations=citations,
         matched_documents=matched_documents,
         answer_limited=False,
-        message=f"已在 {len(knowledge_bases)} 个知识库范围内完成检索。",
+        message=(
+            fallback_message
+            if used_fallback
+            else f"已在 {len(knowledge_bases)} 个知识库范围内完成检索。"
+        ),
+        session_id=active_session.id if active_session else None,
     )
+    persist_chat_turn(session, active_session, normalized_question, response, raw_results)
+    touch_knowledge_bases(session, effective_knowledge_base_ids)
+    return response
+
+
+def create_session_for_knowledge_bases(session: Session, knowledge_base_ids: Sequence[str], title: Optional[str] = None) -> ChatSession:
+    now = utc_now()
+    chat_session = ChatSession(
+        id=str(uuid4()),
+        title=title.strip() if title and title.strip() else "新会话",
+        selected_kb_ids_json=json.dumps(list(knowledge_base_ids), ensure_ascii=False),
+        last_message_at=None,
+        created_at=now,
+        updated_at=now,
+    )
+    return create_chat_session(session, chat_session)
+
+
+def build_contextual_question(session: Session, session_id: Optional[str], question: str) -> str:
+    if not session_id:
+        return question
+    recent_messages = list_recent_chat_messages(session, session_id, MAX_CONTEXT_MESSAGES)
+    context_lines: List[str] = []
+    recent_user_questions: List[str] = []
+    for message in recent_messages:
+        if message.role == "user" and message.question_text:
+            context_lines.append(f"用户：{message.question_text}")
+            recent_user_questions.append(message.question_text)
+        elif message.role == "assistant" and message.answer_markdown:
+            context_lines.append(f"助手：{message.answer_markdown}")
+    if not context_lines:
+        return question
+
+    subject_terms: List[str] = []
+    for previous_question in recent_user_questions[-3:]:
+        subject_terms.extend(extract_subject_terms(previous_question))
+        subject_terms.extend(extract_focus_terms(previous_question)[:2])
+
+    normalized_subject_terms = dedupe_terms(subject_terms)[:6]
+    if normalized_subject_terms:
+        return f"{' '.join(normalized_subject_terms)} {question}"
+
+    context_lines.append(f"用户：{question}")
+    return "\n".join(context_lines[-MAX_CONTEXT_MESSAGES - 1 :])
+
+
+def persist_chat_turn(
+    session: Session,
+    active_session: Optional[ChatSession],
+    question: str,
+    response: QAAskResponse,
+    raw_results: Dict[str, List[List[object]]],
+) -> None:
+    if active_session is None:
+        return
+
+    now = utc_now()
+    create_chat_message(
+        session,
+        ChatMessage(
+            id=str(uuid4()),
+            session_id=active_session.id,
+            role="user",
+            question_text=question,
+            answer_markdown=None,
+            citations_json=None,
+            retrieval_snapshot_json=None,
+            created_at=now,
+        ),
+    )
+    create_chat_message(
+        session,
+        ChatMessage(
+            id=str(uuid4()),
+            session_id=active_session.id,
+            role="assistant",
+            question_text=None,
+            answer_markdown=response.answer,
+            citations_json=json.dumps([item.model_dump() for item in response.citations], ensure_ascii=False),
+            retrieval_snapshot_json=json.dumps(raw_results, ensure_ascii=False),
+            created_at=utc_now(),
+        ),
+    )
+    active_session.last_message_at = utc_now()
+    active_session.updated_at = utc_now()
+    update_chat_session(session, active_session)
+
+
+def touch_knowledge_bases(session: Session, knowledge_base_ids: Sequence[str]) -> None:
+    now = utc_now()
+    for knowledge_base_id in knowledge_base_ids:
+        knowledge_base = get_knowledge_base(session, knowledge_base_id)
+        if knowledge_base is None:
+            continue
+        knowledge_base.last_opened_at = now
+        knowledge_base.updated_at = now
+        session.add(knowledge_base)
+    session.commit()
 
 
 def validate_knowledge_bases(session: Session, knowledge_base_ids: Sequence[str]) -> Dict[str, KnowledgeBase]:
@@ -161,6 +329,204 @@ def validate_knowledge_bases(session: Session, knowledge_base_ids: Sequence[str]
             raise ValueError(f"Knowledge base not found: {knowledge_base_id}")
         result[knowledge_base_id] = knowledge_base
     return result
+
+
+def retrieve_ranked_hits(
+    *,
+    session: Session,
+    knowledge_base_ids: Sequence[str],
+    question: str,
+    top_k: int,
+) -> tuple[List[RetrievalHit], Dict[str, List[List[object]]]]:
+    vector_results = query_vectors(knowledge_base_ids, question, max(top_k * 8, top_k + 16, 32))
+    vector_distance_by_key = index_vector_distances(vector_results)
+    candidates = collect_retrieval_candidates(session, knowledge_base_ids, vector_distance_by_key)
+    hits = rerank_candidates(candidates, question)
+    snapshot = build_retrieval_snapshot(hits[: max(top_k * 4, 12)])
+    return hits, snapshot
+
+
+def index_vector_distances(raw_results: Dict[str, List[List[object]]]) -> Dict[str, float]:
+    documents = raw_results.get("documents", [[]])[0]
+    metadatas = raw_results.get("metadatas", [[]])[0]
+    distances = raw_results.get("distances", [[]])[0]
+    indexed: Dict[str, float] = {}
+
+    for document_text, metadata, distance in zip(documents, metadatas, distances):
+        if not isinstance(document_text, str) or not isinstance(metadata, dict):
+            continue
+        key = make_candidate_key(
+            document_id=str(metadata.get("document_id", "")),
+            location_label=str(metadata.get("location_label", "")),
+            text=document_text,
+        )
+        value = float(distance or 0.0)
+        previous = indexed.get(key)
+        indexed[key] = value if previous is None else min(previous, value)
+
+    return indexed
+
+
+def collect_retrieval_candidates(
+    session: Session,
+    knowledge_base_ids: Sequence[str],
+    vector_distance_by_key: Dict[str, float],
+) -> List[RetrievalCandidate]:
+    if not knowledge_base_ids:
+        return []
+
+    chunk_stmt = (
+        select(
+            DocumentChunk.knowledge_base_id,
+            KnowledgeBase.name,
+            DocumentChunk.document_id,
+            Document.name,
+            DocumentChunk.location_label,
+            DocumentChunk.text,
+        )
+        .join(Document, Document.id == DocumentChunk.document_id)
+        .join(KnowledgeBase, KnowledgeBase.id == DocumentChunk.knowledge_base_id)
+        .where(DocumentChunk.knowledge_base_id.in_(knowledge_base_ids))
+        .where(Document.parse_status == "done")
+        .order_by(DocumentChunk.document_id.asc(), DocumentChunk.chunk_index.asc())
+    )
+
+    preview_stmt = (
+        select(
+            Document.knowledge_base_id,
+            KnowledgeBase.name,
+            Document.id,
+            Document.name,
+            Document.preview_text,
+        )
+        .join(KnowledgeBase, KnowledgeBase.id == Document.knowledge_base_id)
+        .where(Document.knowledge_base_id.in_(knowledge_base_ids))
+        .where(Document.parse_status != "done")
+    )
+
+    candidates: List[RetrievalCandidate] = []
+    seen_keys: set[str] = set()
+
+    for knowledge_base_id, knowledge_base_name, document_id, document_name, location_label, text in session.execute(chunk_stmt).all():
+        if not isinstance(text, str) or not text.strip():
+            continue
+        key = make_candidate_key(document_id=document_id, location_label=location_label, text=text)
+        candidates.append(
+            RetrievalCandidate(
+                knowledge_base_id=str(knowledge_base_id),
+                knowledge_base_name=str(knowledge_base_name),
+                document_id=str(document_id),
+                document_name=str(document_name),
+                location_label=str(location_label),
+                text=text,
+                vector_distance=vector_distance_by_key.get(key, 2.0),
+            )
+        )
+        seen_keys.add(str(document_id))
+
+    for knowledge_base_id, knowledge_base_name, document_id, document_name, preview_text in session.execute(preview_stmt).all():
+        if str(document_id) in seen_keys:
+            continue
+        if not isinstance(preview_text, str) or not preview_text.strip():
+            continue
+        text = preview_text.strip()
+        key = make_candidate_key(document_id=document_id, location_label="Preview Cache", text=text)
+        candidates.append(
+            RetrievalCandidate(
+                knowledge_base_id=str(knowledge_base_id),
+                knowledge_base_name=str(knowledge_base_name),
+                document_id=str(document_id),
+                document_name=str(document_name),
+                location_label="Preview Cache",
+                text=text,
+                vector_distance=vector_distance_by_key.get(key, 2.0),
+            )
+        )
+
+    return candidates
+
+
+def make_candidate_key(*, document_id: str, location_label: str, text: str) -> str:
+    normalized_text = re.sub(r"\s+", " ", text).strip().lower()
+    return f"{document_id}::{location_label.strip().lower()}::{normalized_text[:160]}"
+
+
+def rerank_candidates(candidates: Sequence[RetrievalCandidate], question: str) -> List[RetrievalHit]:
+    question_terms = build_query_terms(question)
+    overview_question = is_overview_question(question)
+    subject_terms = extract_subject_terms(question)
+    hits: List[RetrievalHit] = []
+
+    for candidate in candidates:
+        lexical_score = compute_lexical_score(candidate.text, question_terms)
+        vector_score = normalize_vector_score(candidate.vector_distance)
+        subject_score = compute_subject_score(candidate.text, subject_terms)
+        document_name_score = compute_document_name_score(candidate.document_name, question_terms, subject_terms)
+        combined_score = (
+            lexical_score * 0.42
+            + vector_score * 0.18
+            + subject_score * 0.22
+            + document_name_score * 0.18
+        )
+
+        subject_anchor_score = max(subject_score, document_name_score)
+        if subject_terms:
+            if subject_anchor_score >= 0.85:
+                combined_score += SUBJECT_BOOST
+            elif subject_anchor_score < 0.2 and lexical_score < 0.28:
+                combined_score -= SUBJECT_PENALTY
+
+        if candidate.location_label.lower().startswith("preview") and lexical_score >= 0.12:
+            combined_score += 0.04
+
+        vector_gate = 0.30 if overview_question else 0.50
+        if (
+            lexical_score < 0.08
+            and document_name_score < 0.18
+            and subject_score < 0.18
+            and vector_score < vector_gate
+        ):
+            continue
+        if lexical_score < 0.16 and subject_anchor_score < 0.2 and vector_score < 0.25:
+            continue
+
+        hits.append(
+            RetrievalHit(
+                knowledge_base_id=candidate.knowledge_base_id,
+                knowledge_base_name=candidate.knowledge_base_name,
+                document_id=candidate.document_id,
+                document_name=candidate.document_name,
+                location_label=candidate.location_label,
+                text=candidate.text,
+                vector_distance=candidate.vector_distance,
+                lexical_score=lexical_score,
+                subject_score=subject_score,
+                combined_score=combined_score,
+            )
+        )
+
+    hits.sort(key=lambda item: item.combined_score, reverse=True)
+    return hits
+
+
+def build_retrieval_snapshot(hits: Sequence[RetrievalHit]) -> Dict[str, List[List[object]]]:
+    return {
+        "documents": [[hit.text for hit in hits]],
+        "metadatas": [[
+            {
+                "knowledge_base_id": hit.knowledge_base_id,
+                "knowledge_base_name": hit.knowledge_base_name,
+                "document_id": hit.document_id,
+                "document_name": hit.document_name,
+                "location_label": hit.location_label,
+                "combined_score": round(hit.combined_score, 4),
+                "lexical_score": round(hit.lexical_score, 4),
+                "subject_score": round(hit.subject_score, 4),
+            }
+            for hit in hits
+        ]],
+        "distances": [[round(hit.vector_distance, 4) for hit in hits]],
+    }
 
 
 def rerank_hits(raw_results: Dict[str, List[List[object]]], question: str) -> List[RetrievalHit]:
@@ -215,12 +581,30 @@ def select_top_hits(hits: Sequence[RetrievalHit]) -> List[RetrievalHit]:
     lead_score = hits[0].combined_score
     min_score = max(MIN_EVIDENCE_SCORE, lead_score * RELATIVE_HIT_SCORE_THRESHOLD)
     lead_subject_score = hits[0].subject_score
-    selected = [
+    eligible = [
         hit
         for hit in hits
         if hit.combined_score >= min_score
         and (lead_subject_score < 0.2 or hit.subject_score >= max(0.45, lead_subject_score * 0.72))
     ]
+
+    selected: List[RetrievalHit] = []
+    selected_document_ids: set[str] = set()
+    for hit in eligible:
+        if hit.document_id in selected_document_ids:
+            continue
+        selected.append(hit)
+        selected_document_ids.add(hit.document_id)
+        if len(selected) >= MAX_CITATIONS:
+            return selected
+
+    for hit in eligible:
+        if len(selected) >= MAX_CITATIONS:
+            break
+        if hit in selected:
+            continue
+        selected.append(hit)
+
     return selected[:MAX_CITATIONS]
 
 
@@ -252,6 +636,12 @@ def compute_lexical_score(document_text: str, question_terms: Sequence[str]) -> 
             weighted_hits += weight * best_score
 
     return min(1.0, weighted_hits / max(weighted_total, 1.0))
+
+
+def compute_document_name_score(document_name: str, question_terms: Sequence[str], subject_terms: Sequence[str]) -> float:
+    lexical_score = compute_lexical_score(document_name, question_terms)
+    subject_score = compute_subject_score(document_name, subject_terms)
+    return max(lexical_score, subject_score)
 
 
 def is_overview_question(question: str) -> bool:
@@ -498,8 +888,62 @@ def build_answer(question: str, citations: Sequence[QACitation]) -> str:
     return f"{answer_body}。"
 
 
+def generate_answer_with_qwen(
+    *,
+    question: str,
+    knowledge_base_names: Sequence[str],
+    citations: Sequence[QACitation],
+) -> tuple[str, bool, str]:
+    settings = get_settings()
+    fallback_answer = build_answer(question, citations)
+
+    if not settings.llm_enabled:
+        return fallback_answer, True, "本地模型未启用，已使用抽取式回答。"
+
+    system_prompt, user_prompt = build_qa_prompts(
+        question=question,
+        knowledge_base_names=knowledge_base_names,
+        citations=citations,
+    )
+
+    try:
+        answer = generate_text(
+            model=settings.llm_model_name,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=settings.llm_temperature,
+            max_tokens=settings.llm_max_tokens,
+            base_url=settings.llm_base_url,
+            timeout_seconds=settings.llm_timeout_seconds,
+        )
+        cleaned_answer = answer.strip()
+        if cleaned_answer:
+            return cleaned_answer, False, ""
+    except LLMServiceUnavailableError:
+        if not settings.llm_fallback_to_extractive:
+            raise
+        return fallback_answer, True, "本地 Ollama 服务不可用，已回退到抽取式回答。"
+    except LLMModelNotFoundError:
+        if not settings.llm_fallback_to_extractive:
+            raise
+        return fallback_answer, True, f"本地模型 {settings.llm_model_name} 未安装，已回退到抽取式回答。"
+    except LLMRequestTimeoutError:
+        if not settings.llm_fallback_to_extractive:
+            raise
+        return fallback_answer, True, "本地模型响应超时，已回退到抽取式回答。"
+    except LLMEmptyResponseError:
+        if not settings.llm_fallback_to_extractive:
+            raise
+        return fallback_answer, True, "本地模型未返回有效内容，已回退到抽取式回答。"
+    except LLMClientError:
+        if not settings.llm_fallback_to_extractive:
+            raise
+
+    return fallback_answer, True, "本地模型调用失败，已回退到抽取式回答。"
+
+
 def build_snippet_and_highlights(text: str, question: str) -> tuple[str, List[tuple[int, int]]]:
-    raw_text = re.sub(r"\s+", " ", text).strip()
+    raw_text = normalize_source_text(text)
     if not raw_text:
         return "", []
 
@@ -516,14 +960,7 @@ def build_snippet_and_highlights(text: str, question: str) -> tuple[str, List[tu
             first_end = start + len(term)
             break
 
-    if first_start is None:
-        snippet_start = 0
-        snippet_end = min(len(raw_text), 180)
-    else:
-        snippet_start = max(0, first_start - 40)
-        snippet_end = min(len(raw_text), max(first_end + 80, first_start + 120))
-
-    snippet = raw_text[snippet_start:snippet_end].strip()
+    snippet = extract_best_snippet(raw_text, candidate_terms, first_start, first_end)
     highlights: List[tuple[int, int]] = []
     snippet_lower = snippet.lower()
     for term in candidate_terms:
@@ -536,6 +973,87 @@ def build_snippet_and_highlights(text: str, question: str) -> tuple[str, List[tu
             cursor = index + len(term)
 
     return snippet, merge_ranges(highlights)
+
+
+def normalize_source_text(text: str) -> str:
+    normalized = re.sub(r"\s+", " ", text).strip()
+    patterns = [
+        r"\bhttps?://\S+",
+        r"\b\d{4}/\d{1,2}/\d{1,2}\s+\d{1,2}:\d{2}\b",
+        r"第\d+/\d+页",
+        r"第\d+页",
+    ]
+    for pattern in patterns:
+        normalized = re.sub(pattern, " ", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+def extract_best_snippet(
+    raw_text: str,
+    candidate_terms: Sequence[str],
+    first_start: Optional[int],
+    first_end: Optional[int],
+) -> str:
+    segments = split_into_meaningful_segments(raw_text)
+    if not segments:
+        return raw_text[:220].strip()
+
+    best_segment = ""
+    best_score = -1.0
+    for segment in segments:
+        lexical_score = compute_lexical_score(segment, candidate_terms)
+        if lexical_score <= 0 and not contains_any_term(segment, candidate_terms):
+            continue
+        density_bonus = min(len(segment), 180) / 1800
+        score = lexical_score + density_bonus
+        if score > best_score:
+            best_score = score
+            best_segment = segment
+
+    if best_segment:
+        return trim_snippet(best_segment, candidate_terms, 220)
+
+    if first_start is None:
+        return trim_snippet(raw_text[:220], candidate_terms, 220)
+
+    snippet_start = max(0, first_start - 50)
+    snippet_end = min(len(raw_text), max((first_end or first_start) + 110, first_start + 140))
+    return trim_snippet(raw_text[snippet_start:snippet_end], candidate_terms, 220)
+
+
+def split_into_meaningful_segments(text: str) -> List[str]:
+    coarse_segments = [segment.strip() for segment in re.split(r"[。；;!?！？\n]", text) if segment.strip()]
+    result: List[str] = []
+    for segment in coarse_segments:
+        if " | " in segment:
+            pieces = [piece.strip() for piece in segment.split(" | ") if piece.strip()]
+            result.extend(piece for piece in pieces if len(piece) >= 6)
+            continue
+        result.append(segment)
+    return [segment for segment in result if len(segment) >= 6]
+
+
+def contains_any_term(text: str, terms: Sequence[str]) -> bool:
+    lowered = text.lower()
+    return any(term.lower() in lowered for term in terms if term)
+
+
+def trim_snippet(text: str, candidate_terms: Sequence[str], limit: int) -> str:
+    snippet = text.strip()
+    if len(snippet) <= limit:
+        return snippet
+
+    lowered = snippet.lower()
+    best_start = 0
+    for term in candidate_terms:
+        index = lowered.find(term.lower())
+        if index >= 0:
+            best_start = max(0, index - 36)
+            break
+
+    trimmed = snippet[best_start : best_start + limit].strip()
+    return trimmed
 
 
 def merge_ranges(ranges: Sequence[tuple[int, int]]) -> List[tuple[int, int]]:

@@ -5,7 +5,8 @@ from pydantic import BaseModel, Field
 
 class QAAskRequest(BaseModel):
     question: str = Field(min_length=1)
-    knowledge_base_ids: List[str] = Field(min_length=1)
+    knowledge_base_ids: List[str] = Field(default_factory=list)
+    session_id: Optional[str] = None
     top_k: int = Field(default=5, ge=1, le=10)
 
 
@@ -39,3 +40,4 @@ class QAAskResponse(BaseModel):
     matched_documents: List[QAMatchedDocument]
     answer_limited: bool
     message: Optional[str] = None
+    session_id: Optional[str] = None

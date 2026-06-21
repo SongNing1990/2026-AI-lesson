@@ -27,3 +27,18 @@ class KnowledgeBaseResponse(BaseModel):
 class DeleteResponse(BaseModel):
     success: bool
     deleted_id: str
+
+
+class KnowledgeBaseReindexFailure(BaseModel):
+    document_id: str
+    document_name: str
+    reason: str
+
+
+class KnowledgeBaseReindexResponse(BaseModel):
+    knowledge_base_id: str
+    knowledge_base_name: str
+    total_documents: int
+    reindexed_documents: int
+    failed_documents: list[KnowledgeBaseReindexFailure]
+    total_chunks: int
