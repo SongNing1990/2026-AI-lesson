@@ -1,6 +1,27 @@
 :root {
   color-scheme: light;
-  font-family: "PingFang SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+  --font-body:
+    "PingFang SC",
+    "Hiragino Sans GB",
+    "Microsoft YaHei",
+    "Noto Sans CJK SC",
+    "Source Han Sans SC",
+    system-ui,
+    sans-serif;
+  --font-display:
+    "Songti SC",
+    "STSong",
+    "SimSun",
+    "Noto Serif CJK SC",
+    "Source Han Serif SC",
+    serif;
+  --font-mono:
+    "SF Mono",
+    "Menlo",
+    "Consolas",
+    monospace;
+  font-family: var(--font-body);
+  font-variant-east-asian: simplified;
   background: #edf5ff;
   color: #102346;
 }
@@ -15,9 +36,19 @@ body {
     radial-gradient(circle at top left, rgba(115, 170, 255, 0.24), transparent 26rem),
     radial-gradient(circle at bottom right, rgba(193, 225, 255, 0.36), transparent 24rem),
     linear-gradient(180deg, #f6faff 0%, #eaf2ff 100%);
+  font-family: inherit;
   min-height: 100vh;
   height: 100vh;
   overflow: hidden;
+}
+
+h1,
+h2,
+h3,
+.section-kicker,
+.card-kicker,
+.eyebrow {
+  font-family: var(--font-display);
 }
 
 a {
@@ -60,19 +91,67 @@ select {
 .topbar-brand {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 16px;
+  min-width: 0;
 }
 
 .topbar-brand strong {
-  font-size: 18px;
+  font-size: 24px;
+  line-height: 1.1;
+  letter-spacing: 0.02em;
+  color: #123768;
 }
 
 .topbar-mark {
-  width: 18px;
-  height: 18px;
-  border-radius: 6px;
-  background: linear-gradient(135deg, #1647ba 0%, #78c0ff 100%);
-  box-shadow: 0 12px 28px rgba(22, 71, 186, 0.28);
+  position: relative;
+  flex: 0 0 auto;
+  width: 34px;
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.topbar-mark-page {
+  position: absolute;
+  border-radius: 10px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.98) 0%, rgba(236, 245, 255, 0.96) 100%);
+  border: 1px solid rgba(24, 82, 194, 0.12);
+  box-shadow: 0 10px 24px rgba(34, 84, 178, 0.18);
+}
+
+.topbar-mark-page-back {
+  width: 24px;
+  height: 26px;
+  left: 4px;
+  top: 6px;
+  background: linear-gradient(180deg, rgba(209, 230, 255, 0.95) 0%, rgba(184, 215, 255, 0.88) 100%);
+}
+
+.topbar-mark-page-front {
+  width: 24px;
+  height: 28px;
+  right: 3px;
+  top: 2px;
+  background: linear-gradient(180deg, #1750c3 0%, #77c3ff 100%);
+}
+
+.topbar-mark-line {
+  position: absolute;
+  left: 5px;
+  height: 2px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.88);
+}
+
+.topbar-mark-line-long {
+  top: 9px;
+  width: 12px;
+}
+
+.topbar-mark-line-short {
+  top: 14px;
+  width: 8px;
 }
 
 .topbar-nav {
@@ -132,6 +211,7 @@ select {
 
 .sidebar-kicker {
   color: rgba(241, 247, 255, 0.72);
+  font-family: var(--font-body);
 }
 
 .category-head h1 {
@@ -357,7 +437,7 @@ select {
   display: grid;
   grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
   gap: 0;
-  padding: 24px;
+  padding: 18px 24px 24px;
   position: relative;
   height: 100%;
   min-height: 0;
@@ -385,7 +465,7 @@ select {
 
 .kb-board,
 .chat-board {
-  padding: 20px 24px;
+  padding: 16px 24px;
   min-height: 0;
   overflow: hidden;
 }
@@ -423,7 +503,7 @@ select {
 
 .kb-board-head,
 .chat-board-head {
-  margin-bottom: 18px;
+  margin-bottom: 12px;
 }
 
 .kb-board-head h2,
@@ -432,6 +512,18 @@ select {
 .modal-head h3,
 .settings-hero h2 {
   margin: 0;
+}
+
+.kb-board-head h2 {
+  font-size: 18px;
+  line-height: 1.35;
+  font-family: var(--font-body);
+}
+
+.chat-board-head h2 {
+  font-size: 20px;
+  line-height: 1.35;
+  font-family: var(--font-body);
 }
 
 .kb-board-title-row {
@@ -577,6 +669,7 @@ select {
   padding: 8px 12px;
   border-radius: 999px;
   font-size: 12px;
+  font-family: var(--font-mono);
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
@@ -678,6 +771,7 @@ select {
 .detail-block p,
 .settings-hero p,
 .settings-item code {
+  font-family: var(--font-mono);
   margin: 0;
   color: #5b6f96;
   line-height: 1.7;
@@ -891,20 +985,24 @@ select {
   flex: 0 0 auto;
   background: rgba(248, 251, 255, 0.98);
   margin-top: auto;
+  padding-top: 6px;
+  overflow: visible;
 }
 
 .qa-answering-hint {
-  display: inline-flex;
+  display: flex;
   align-items: center;
   gap: 10px;
-  margin: 0 0 10px;
-  padding: 10px 14px;
+  margin: 0 0 12px;
+  padding: 14px 14px 13px;
   border-radius: 14px;
   background: linear-gradient(135deg, rgba(20, 70, 184, 0.1) 0%, rgba(107, 185, 255, 0.16) 100%);
   border: 1px solid rgba(58, 121, 245, 0.14);
   color: #1a4ebd;
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 600;
+  line-height: 1.65;
+  font-family: var(--font-body);
 }
 
 .qa-answering-dot {
@@ -1013,6 +1111,10 @@ select {
   min-width: 112px;
   min-height: 44px;
   font-weight: 600;
+}
+
+.qa-input-row.answering .qa-action-row {
+  display: none;
 }
 
 .qa-inline-error {
@@ -1141,12 +1243,30 @@ select {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  margin-bottom: 14px;
+  margin-bottom: 10px;
+  min-height: 0;
+  padding-top: 0;
 }
 
 .document-preview-head h3 {
   margin: 0;
   font-size: 20px;
+  line-height: 1.5;
+  font-family: var(--font-body);
+}
+
+.qa-window-head {
+  padding: 2px 0 6px;
+}
+
+.qa-window-title {
+  display: inline-block;
+  margin: 0;
+  font-size: 16px;
+  line-height: 1.35;
+  font-weight: 700;
+  font-family: var(--font-body);
+  color: #143564;
 }
 
 .document-preview-head span {
@@ -1549,6 +1669,7 @@ select {
 }
 
 .llm-status-meta code {
+  font-family: var(--font-mono);
   padding: 6px 10px;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.9);

@@ -1803,7 +1803,7 @@ function AppWorkspace() {
       `答案：${qaResult.answer}`,
     ];
 
-    context.font = "28px PingFang SC";
+    context.font = '28px "Songti SC", "STSong", "SimSun", serif';
     const wrapped = lines.flatMap((line) => wrapCanvasText(context, line, contentWidth));
     const height = Math.max(720, 220 + wrapped.length * 40);
 
@@ -1824,14 +1824,14 @@ function AppWorkspace() {
     context.stroke();
 
     context.fillStyle = "#12305f";
-    context.font = "bold 40px PingFang SC";
+    context.font = 'bold 40px "Songti SC", "STSong", "SimSun", serif';
     context.fillText("知识库问答分享", 88, 118);
 
-    context.font = "24px PingFang SC";
+    context.font = '24px "Songti SC", "STSong", "SimSun", serif';
     context.fillStyle = "#5b6f96";
     context.fillText("问题与答案", 88, 162);
 
-    context.font = "28px PingFang SC";
+    context.font = '28px "Songti SC", "STSong", "SimSun", serif';
     context.fillStyle = "#163768";
     let cursorY = 230;
     for (const line of wrapped) {
@@ -2772,10 +2772,8 @@ function AppWorkspace() {
 
                 <div className="qa-panel center-qa-column">
                   <div className="document-detail-card qa-card">
-                    <div className="document-preview-head">
-                      <div>
-                        <h3>问答窗口</h3>
-                      </div>
+                    <div className="qa-window-head">
+                      <h3 className="qa-window-title">问答窗口</h3>
                     </div>
 
                     <div className="chat-history-panel">
@@ -2830,7 +2828,7 @@ function AppWorkspace() {
                           <span>正在回答，请等待…</span>
                         </div>
                       ) : null}
-                      <div className="qa-input-row">
+                      <div className={`qa-input-row ${isAnswering ? "answering" : ""}`}>
                         <textarea
                           value={questionDraft}
                           onChange={(event) => setQuestionDraft(event.target.value)}
@@ -3766,7 +3764,13 @@ export default function App() {
     <div className="app-shell">
       <header className="topbar">
         <div className="topbar-brand">
-          <span className="topbar-mark" />
+          <span className="topbar-mark" aria-hidden="true">
+            <span className="topbar-mark-page topbar-mark-page-back" />
+            <span className="topbar-mark-page topbar-mark-page-front">
+              <span className="topbar-mark-line topbar-mark-line-long" />
+              <span className="topbar-mark-line topbar-mark-line-short" />
+            </span>
+          </span>
           <strong>本地知识库问答工具</strong>
         </div>
         <nav className="topbar-nav">
